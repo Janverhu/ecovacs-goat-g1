@@ -1,0 +1,123 @@
+{
+  "config": {
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_account%]"
+    },
+    "error": {
+      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
+      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
+      "unknown": "[%key:common::config_flow::error::unknown%]",
+      "invalid_name": "Enter a name."
+    },
+    "step": {
+      "user": {
+        "data": {
+          "name": "[%key:common::config_flow::data::name%]",
+          "country": "[%key:common::config_flow::data::country%]",
+          "password": "[%key:common::config_flow::data::password%]",
+          "username": "[%key:common::config_flow::data::username%]"
+        }
+      }
+    }
+  },
+  "entity": {
+    "number": {
+      "cut_direction": {
+        "name": "Cut direction"
+      },
+      "rain_delay": {
+        "name": "Rain delay"
+      }
+    },
+    "sensor": {
+      "battery_level": {
+        "name": "Battery level"
+      },
+      "error": {
+        "name": "Error",
+        "state_attributes": {
+          "description": {
+            "name": "Description"
+          }
+        }
+      },
+      "lifespan_blade": {
+        "name": "Blade lifespan"
+      },
+      "lifespan_lens_brush": {
+        "name": "Lens brush lifespan"
+      },
+      "network_ip": {
+        "name": "IP address"
+      },
+      "network_rssi": {
+        "name": "Wi-Fi RSSI"
+      },
+      "network_ssid": {
+        "name": "Wi-Fi SSID"
+      },
+      "stats_area": {
+        "name": "Area mowed"
+      },
+      "stats_time": {
+        "name": "Mowing duration"
+      },
+      "total_stats_area": {
+        "name": "Total area mowed"
+      },
+      "total_stats_cleanings": {
+        "name": "Total mowings"
+      },
+      "total_stats_time": {
+        "name": "Total mowing duration"
+      }
+    },
+    "select": {
+      "mowing_efficiency": {
+        "name": "Mowing efficiency"
+      },
+      "obstacle_avoidance": {
+        "name": "Obstacle avoidance"
+      }
+    },
+    "switch": {
+      "ai_recognition": {
+        "name": "AI Recognition"
+      },
+      "animal_protection": {
+        "name": "Animal protection"
+      },
+      "border_switch": {
+        "name": "Border switch"
+      },
+      "cross_map_border_warning": {
+        "name": "Cross map border warning"
+      },
+      "move_up_warning": {
+        "name": "Move up warning"
+      },
+      "rain_sensor": {
+        "name": "Rain sensor"
+      },
+      "safer_mode": {
+        "name": "Safer Mode"
+      }
+    },
+    "time": {
+      "animal_protection_end": {
+        "name": "Animal protection end"
+      },
+      "animal_protection_start": {
+        "name": "Animal protection start"
+      }
+    },
+    "button": {
+      "end_mowing": {
+        "name": "End mowing"
+      },
+      "refresh_state": {
+        "name": "Refresh state"
+      }
+    }
+  }
+}

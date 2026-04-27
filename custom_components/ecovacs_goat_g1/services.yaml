@@ -1,0 +1,6 @@
+refresh_state:
+  name: Refresh state
+  description: Refresh mower state if MQTT/readback data is stale.
+  target:
+    entity:
+      integration: ecovacs_goat_g1

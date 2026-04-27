@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# Home Assistant local runtime
+.storage/
+.storage/**
+home-assistant.log*
+*.db
+*.db-*
+secrets.yaml
+known_devices.yaml
+
+# Capture / reverse engineering artifacts
+*.pcap
+*.pcapng
+*.mitm
+*.har
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

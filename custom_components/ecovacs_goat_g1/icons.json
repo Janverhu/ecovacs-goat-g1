@@ -1,0 +1,103 @@
+{
+  "entity": {
+    "number": {
+      "cut_direction": {
+        "default": "mdi:angle-acute"
+      },
+      "rain_delay": {
+        "default": "mdi:weather-pouring"
+      }
+    },
+    "sensor": {
+      "error": {
+        "default": "mdi:alert-circle"
+      },
+      "lifespan_blade": {
+        "default": "mdi:saw-blade"
+      },
+      "lifespan_brush": {
+        "default": "mdi:broom"
+      },
+      "lifespan_filter": {
+        "default": "mdi:air-filter"
+      },
+      "lifespan_lens_brush": {
+        "default": "mdi:broom"
+      },
+      "network_ip": {
+        "default": "mdi:ip-network-outline"
+      },
+      "network_rssi": {
+        "default": "mdi:signal-variant"
+      },
+      "network_ssid": {
+        "default": "mdi:wifi"
+      },
+      "station_state": {
+        "default": "mdi:home"
+      },
+      "stats_area": {
+        "default": "mdi:floor-plan"
+      },
+      "stats_time": {
+        "default": "mdi:timer-outline"
+      },
+      "total_stats_area": {
+        "default": "mdi:floor-plan"
+      },
+      "total_stats_time": {
+        "default": "mdi:timer-outline"
+      },
+      "total_stats_cleanings": {
+        "default": "mdi:counter"
+      }
+    },
+    "select": {
+      "mowing_efficiency": {
+        "default": "mdi:speedometer"
+      },
+      "obstacle_avoidance": {
+        "default": "mdi:image-filter-hdr"
+      }
+    },
+    "switch": {
+      "ai_recognition": {
+        "default": "mdi:robot"
+      },
+      "animal_protection": {
+        "default": "mdi:paw"
+      },
+      "border_switch": {
+        "default": "mdi:land-fields"
+      },
+      "cross_map_border_warning": {
+        "default": "mdi:border-none-variant"
+      },
+      "move_up_warning": {
+        "default": "mdi:arrow-up-bold-box-outline"
+      },
+      "rain_sensor": {
+        "default": "mdi:weather-pouring"
+      },
+      "safer_mode": {
+        "default": "mdi:shield-half-full"
+      }
+    },
+    "time": {
+      "animal_protection_end": {
+        "default": "mdi:clock-end"
+      },
+      "animal_protection_start": {
+        "default": "mdi:clock-start"
+      }
+    },
+    "button": {
+      "end_mowing": {
+        "default": "mdi:stop-circle-outline"
+      },
+      "refresh_state": {
+        "default": "mdi:refresh"
+      }
+    }
+  }
+}

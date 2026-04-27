@@ -1,0 +1,27 @@
+# Example automations for the mower-only ECOVACS integration.
+# Copy a block to automations.yaml and update entity_id/notification targets.
+
+alias: "Ecovacs Mower Unexpected Docked State"
+description: "Notify when the mower quickly returns to docked after starting"
+trigger:
+  - platform: state
+    entity_id: lawn_mower.your_ecovacs_mower  # CHANGE THIS to your mower entity
+    from: "mowing"
+    to: "docked"
+    for:
+      seconds: 5
+condition:
+  - condition: template
+    value_template: >
+      {{ (now() - states.lawn_mower.your_ecovacs_mower.last_changed).total_seconds() < 60 }}
+action:
+  - service: system_log.write
+    data:
+      message: "ECOVACS mower returned to docked shortly after mowing started"
+      level: warning
+  - service: notify.notify
+    data:
+      title: "Mower Stopped"
+      message: "The ECOVACS mower returned to docked shortly after mowing started."
+
+mode: single
