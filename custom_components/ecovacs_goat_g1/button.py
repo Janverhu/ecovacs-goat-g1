@@ -18,7 +18,7 @@ BUTTONS: tuple[ButtonEntityDescription, ...] = (
     ),
     ButtonEntityDescription(
         key="end_mowing",
-        name="End mowing",
+        name="Stop mowing",
     ),
 )
 
@@ -52,6 +52,6 @@ class MowerButton(EcovacsMowerEntity, ButtonEntity):
         """Handle button press."""
         match self.entity_description.key:
             case "refresh_state":
-                await self.coordinator.async_refresh_if_stale()
+                await self.coordinator.async_refresh_state()
             case "end_mowing":
                 await self.coordinator.end_mowing()

@@ -79,6 +79,8 @@ class MowerStats:
     """Mower statistics."""
 
     area: int | None = None
+    job_area: int | None = None
+    progress: float | None = None
     duration: int | None = None
     total_area: int | None = None
     total_duration: int | None = None

@@ -75,6 +75,33 @@ def test_grouped_get_info_keeps_docked_when_idle_follows_charging() -> None:
     assert state.charging is True
 
 
+def test_grouped_get_info_reports_paused_when_clean_task_is_charging() -> None:
+    """A charging pause during a clean task should not report as mowing."""
+    state = apply_response(
+        MowerState(),
+        "getInfo",
+        {
+            "body": {
+                "data": {
+                    "getChargeState": {
+                        "data": {"isCharging": 1, "mode": "slot"},
+                    },
+                    "getCleanInfo_V2": {
+                        "data": {
+                            "trigger": "none",
+                            "state": "clean",
+                            "cleanState": {"motionState": "pause"},
+                        }
+                    },
+                }
+            }
+        },
+    )
+
+    assert state.activity is MowerActivity.PAUSED
+    assert state.charging is True
+
+
 def test_grouped_get_info_caches_task_id_for_app_style_writes() -> None:
     """Captured write payloads reuse the current task id from stats readbacks."""
     state = apply_response(
@@ -83,7 +110,14 @@ def test_grouped_get_info_caches_task_id_for_app_style_writes() -> None:
         {
             "body": {
                 "data": {
-                    "getStats": {"data": {"mowid": "12345", "time": 1}},
+                    "getStats": {
+                        "data": {
+                            "mowid": "12345",
+                            "time": 1,
+                            "area": 2538175,
+                            "mowedArea": 1269088,
+                        }
+                    },
                     "getLastTimeStats": {"data": {"cid": "12345", "stop": 1}},
                 }
             }
@@ -91,6 +125,26 @@ def test_grouped_get_info_caches_task_id_for_app_style_writes() -> None:
     )
 
     assert state.task_id == "12345"
+    assert state.stats.area == 1269088
+    assert state.stats.job_area == 2538175
+    assert state.stats.progress == 50.0
+
+
+def test_stats_prefers_reported_progress_when_available() -> None:
+    """The app may report progress separately from mowed-area ratio."""
+    state = apply_command_data(
+        MowerState(),
+        "getStats",
+        {
+            "area": 2538175,
+            "mowedArea": 1269088,
+            "progress": 93,
+        },
+    )
+
+    assert state.stats.area == 1269088
+    assert state.stats.job_area == 2538175
+    assert state.stats.progress == 93
 
 
 def test_mqtt_setting_push_updates_cache() -> None:
@@ -190,6 +244,29 @@ def test_captured_lifecycle_and_battery_pushes_update_cache() -> None:
 
     assert state.battery == 94
     assert state.activity is MowerActivity.RETURNING
+
+
+def test_clean_pause_push_reports_paused_even_when_state_is_clean() -> None:
+    """The app can report state=clean while motionState carries the pause."""
+    state = apply_mqtt_payload(
+        MowerState(activity=MowerActivity.MOWING),
+        "iot/atr/onCleanInfo_V2/endpoint/77atlz/ONb7/j",
+        b'{"body":{"data":{"trigger":"none","state":"clean","cleanState":{"motionState":"pause"}}}}',
+    )
+
+    assert state.activity is MowerActivity.PAUSED
+
+
+def test_clean_working_clears_stale_charging_state() -> None:
+    """A resumed working payload should win over stale charging state."""
+    state = apply_mqtt_payload(
+        MowerState(charging=True, activity=MowerActivity.DOCKED),
+        "iot/atr/onCleanInfo_V2/endpoint/77atlz/ONb7/j",
+        b'{"body":{"data":{"trigger":"none","state":"clean","cleanState":{"motionState":"working"}}}}',
+    )
+
+    assert state.activity is MowerActivity.MOWING
+    assert state.charging is False
 
 
 def test_protect_state_does_not_overwrite_rain_delay_setting() -> None:

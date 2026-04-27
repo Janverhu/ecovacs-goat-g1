@@ -30,11 +30,12 @@ That design keeps the dependency surface small and avoids repeatedly sending bro
 
 ## Features
 
-- Lawn mower entity: start or resume mowing, pause, return to charge.
-- Button entities: refresh state, end mowing.
+- Lawn mower entity: start or resume mowing, stop mowing, return to charge.
+- Button entities: refresh state, stop mowing.
 - Sensors: battery, error, Wi-Fi diagnostics, current/total mowing stats, blade and lens brush lifespan.
 - Settings: rain sensor and delay, animal protection and time window, AI recognition, edge mowing, safer mode, warning switches, cut direction, mowing efficiency, obstacle avoidance.
 - Service: `ecovacs_goat_g1.refresh_state`, which only performs a grouped refresh when cached MQTT/readback state is stale.
+- Optional Lovelace card with explicit Start/Resume, Stop, Dock, and Refresh controls.
 
 ## Branding
 
@@ -52,6 +53,37 @@ Until this is accepted into any default HACS list, add it as a custom repository
 6. Restart Home Assistant.
 7. Add the integration from **Settings -> Devices & services -> Add integration**.
 
+## Optional Lovelace Card
+
+This repository includes a no-build dashboard card at `www/ecovacs-goat-card.js`. It is optional, but useful because Home Assistant's built-in lawn mower card does not expose a native stop button.
+
+To install the card:
+
+1. Copy `www/ecovacs-goat-card.js` from this repository to your Home Assistant config directory as `www/ecovacs_goat/ecovacs-goat-card.js`.
+2. In Home Assistant, open **Settings -> Dashboards -> Resources**.
+3. Add a JavaScript module resource:
+
+```text
+/local/ecovacs_goat/ecovacs-goat-card.js
+```
+
+After the resource is loaded, the card is available from **Edit dashboard -> Add card -> Custom cards -> Ecovacs GOAT Card**.
+
+Example YAML:
+
+```yaml
+type: custom:ecovacs-goat-card
+entity: lawn_mower.mower
+battery_entity: sensor.mower_battery_level
+error_entity: sensor.mower_error
+area_entity: sensor.mower_mowing_area
+progress_entity: sensor.mower_mowing_progress
+direction_entity: number.mower_cut_direction
+stop_button: button.mower_end_mowing
+refresh_button: button.mower_refresh_state
+name: Mower
+```
+
 ## Configuration
 
 You need your ECOVACS account username, password, and country. The integration uses the ECOVACS cloud; there is no self-hosted mode and no custom REST/MQTT endpoint option.
@@ -65,7 +97,7 @@ The integration is intentionally conservative:
 - MQTT is used for live state and setting updates where possible.
 - Startup performs grouped `getInfo` readbacks to populate entities.
 - Commands perform a stale-only grouped refresh first if no recent MQTT/readback update was seen.
-- The refresh button and service use the same stale-only guard.
+- The refresh button forces a grouped state readback. The refresh service uses the same stale-only guard as command preflight.
 - There is no periodic polling interval.
 
 This is meant to reduce load on the mower and cloud path after an earlier failure mode where the mower itself became unreachable.

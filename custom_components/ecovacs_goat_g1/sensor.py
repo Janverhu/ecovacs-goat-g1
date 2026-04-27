@@ -79,6 +79,20 @@ SENSORS: tuple[MowerSensorDescription, ...] = (
         device_class=SensorDeviceClass.AREA,
     ),
     MowerSensorDescription(
+        key="stats_job_area",
+        name="Mowing area",
+        value_fn=lambda state: state.stats.job_area,
+        native_unit_of_measurement=UnitOfArea.SQUARE_CENTIMETERS,
+        suggested_unit_of_measurement=UnitOfArea.SQUARE_METERS,
+        device_class=SensorDeviceClass.AREA,
+    ),
+    MowerSensorDescription(
+        key="stats_progress",
+        name="Mowing progress",
+        value_fn=lambda state: state.stats.progress,
+        native_unit_of_measurement=PERCENTAGE,
+    ),
+    MowerSensorDescription(
         key="stats_time",
         name="Mowing duration",
         value_fn=lambda state: state.stats.duration,

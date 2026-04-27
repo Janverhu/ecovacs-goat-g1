@@ -39,6 +39,12 @@
       "stats_area": {
         "default": "mdi:floor-plan"
       },
+      "stats_job_area": {
+        "default": "mdi:map-marker-distance"
+      },
+      "stats_progress": {
+        "default": "mdi:progress-check"
+      },
       "stats_time": {
         "default": "mdi:timer-outline"
       },
@@ -93,7 +99,7 @@
     },
     "button": {
       "end_mowing": {
-        "default": "mdi:stop-circle-outline"
+        "default": "mdi:stop"
       },
       "refresh_state": {
         "default": "mdi:refresh"

@@ -153,6 +153,10 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         )
         self.async_set_updated_data(await self._async_refresh_state_groups())
 
+    async def async_refresh_state(self) -> None:
+        """Force a grouped state refresh from the mower."""
+        self.async_set_updated_data(await self._async_refresh_state_groups())
+
     async def _async_refresh_state_groups(self) -> MowerState:
         """Refresh only the app-captured grouped state/settings payloads."""
         state = self.data or MowerState()

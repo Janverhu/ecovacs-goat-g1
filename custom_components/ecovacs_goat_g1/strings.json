@@ -59,6 +59,12 @@
       "stats_area": {
         "name": "Area mowed"
       },
+      "stats_job_area": {
+        "name": "Mowing area"
+      },
+      "stats_progress": {
+        "name": "Mowing progress"
+      },
       "stats_time": {
         "name": "Mowing duration"
       },
@@ -113,7 +119,7 @@
     },
     "button": {
       "end_mowing": {
-        "name": "End mowing"
+        "name": "Stop mowing"
       },
       "refresh_state": {
         "name": "Refresh state"

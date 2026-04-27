@@ -118,22 +118,33 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
                 )
         case "getCleanInfo_V2" | "onCleanInfo_V2" | "getCleanInfo" | "onCleanInfo":
             if isinstance(data, dict):
+                activity = _clean_activity(data, state.activity)
                 state = replace(
                     state,
-                    activity=_clean_activity(data, state.activity),
+                    activity=activity,
+                    charging=False if activity is MowerActivity.MOWING else state.charging,
                     task_id=_task_id(data, state.task_id),
                 )
         case "onWorkState" | "getWorkState":
             if isinstance(data, dict):
-                state = replace(state, activity=_work_state_activity(data, state.activity))
+                activity = _work_state_activity(data, state.activity)
+                state = replace(
+                    state,
+                    activity=activity,
+                    charging=False if activity is MowerActivity.MOWING else state.charging,
+                )
         case "getStats" | "onStats" | "reportStats":
             if isinstance(data, dict):
+                mowed_area = _int(data.get("mowedArea"))
+                job_area = _int(data.get("area"))
                 state = replace(
                     state,
                     task_id=_task_id(data, state.task_id),
                     stats=replace(
                         state.stats,
-                        area=_int(data.get("mowedArea", data.get("area"))),
+                        area=mowed_area if mowed_area is not None else job_area,
+                        job_area=job_area,
+                        progress=_progress(data, mowed_area, job_area),
                         duration=_int(data.get("time")),
                     ),
                 )
@@ -303,12 +314,12 @@ def _clean_activity(data: dict[str, Any], current: MowerActivity) -> MowerActivi
     motion_state = clean_state.get("motionState")
     if data.get("trigger") == "alert":
         return MowerActivity.ERROR
-    if state in ("clean", "washing") or motion_state == "working":
-        return MowerActivity.MOWING
     if motion_state == "pause" or data.get("paused") == 1:
         return MowerActivity.PAUSED
     if state == "goCharging" or motion_state == "goCharging":
         return MowerActivity.RETURNING
+    if state in ("clean", "washing") or motion_state == "working":
+        return MowerActivity.MOWING
     if state == "idle":
         if current is MowerActivity.DOCKED:
             return MowerActivity.DOCKED
@@ -334,7 +345,7 @@ def _work_state_activity(data: dict[str, Any], current: MowerActivity) -> MowerA
         return MowerActivity.MOWING
     if station_state in ("goCharging", "goEmptying"):
         return MowerActivity.RETURNING
-    if station_state in ("emptying", "washing", "drying"):
+    if station_state in ("charging", "emptying", "washing", "drying"):
         return MowerActivity.DOCKED
     if robot_state == "idle" and station_state == "idle":
         return MowerActivity.IDLE
@@ -354,6 +365,21 @@ def _int(value: Any) -> int | None:
         return int(float(value))
     except (TypeError, ValueError):
         return None
+
+
+def _progress(
+    data: dict[str, Any], mowed_area: int | None, job_area: int | None
+) -> float | None:
+    """Return current job mowing progress as a percentage."""
+    for key in ("progress", "cleanProgress", "mowingProgress", "percent", "percentage"):
+        value = _float(data.get(key))
+        if value is not None:
+            if 0 <= value <= 1:
+                value *= 100
+            return round(max(0, min(100, value)), 1)
+    if mowed_area is None or job_area is None or job_area <= 0:
+        return None
+    return round(max(0, min(100, mowed_area / job_area * 100)), 1)
 
 
 def _float(value: Any) -> float | None:
