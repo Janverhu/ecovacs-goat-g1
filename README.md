@@ -36,6 +36,10 @@ That design keeps the dependency surface small and avoids repeatedly sending bro
 - Settings: rain sensor and delay, animal protection and time window, AI recognition, edge mowing, safer mode, warning switches, cut direction, mowing efficiency, obstacle avoidance.
 - Service: `ecovacs_goat_g1.refresh_state`, which only performs a grouped refresh when cached MQTT/readback state is stale.
 
+## Branding
+
+Custom brand icons are in `custom_components/ecovacs_goat_g1/brand/`: `icon.png`, `dark_icon.png`, and matching `icon@2x.png` / `dark_icon@2x.png`. They are produced from a square-cropped side-view product photo of the GOAT G1 (large treaded wheel, antenna, red button), with background made transparent. The dark variant uses increased contrast for visibility on dark themes. Not official ECOVACS assets.
+
 ## Installation With HACS
 
 Until this is accepted into any default HACS list, add it as a custom repository:
