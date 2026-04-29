@@ -25,6 +25,7 @@ from homeassistant.helpers.typing import StateType
 
 from . import EcovacsConfigEntry
 from .entity import EcovacsMowerEntity
+from .goat_g1_models import variant_label
 from .mower_models import MowerState
 
 
@@ -142,6 +143,16 @@ SENSORS: tuple[MowerSensorDescription, ...] = (
         name="Lens brush lifespan",
         value_fn=lambda state: state.lifespans.get("lensBrush"),
         native_unit_of_measurement=PERCENTAGE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MowerSensorDescription(
+        key="goat_g1_model_line",
+        name="GOAT G1 model line",
+        value_fn=lambda state: variant_label(state.goat_g1_variant),
+        attr_fn=lambda state: {
+            "variant_id": state.goat_g1_variant,
+            "robot_features": state.robot_features or {},
+        },
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
 )

@@ -302,4 +302,6 @@ class MowerState:
     stats: MowerStats = field(default_factory=MowerStats)
     map: MowerMap = field(default_factory=MowerMap)
     lifespans: dict[str, float] = field(default_factory=dict)
+    robot_features: dict[str, Any] | None = None
+    goat_g1_variant: str = "unknown"
     raw: dict[str, Any] = field(default_factory=dict)

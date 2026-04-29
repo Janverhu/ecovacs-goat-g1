@@ -17,6 +17,12 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .debug_capture import DebugCaptureStore
+from .goat_g1_models import classify_goat_g1_variant
+from .mower_compat import (
+    ProtocolProfile,
+    apply_resilient_getinfo_group,
+    refresh_live_position,
+)
 from .mower_api import EcovacsApiError, EcovacsMowerApi
 from .mower_messages import (
     MOWING_EFFICIENCY_LEVELS,
@@ -175,7 +181,11 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         self.api = api
         self.device = device
         self._debug_capture = debug_capture
-        self.data = MowerState()
+        self.data = replace(
+            MowerState(),
+            goat_g1_variant=classify_goat_g1_variant(device.model),
+        )
+        self._protocol = ProtocolProfile()
         self._last_mqtt_at: float | None = None
         self._last_position_mqtt_at: float | None = None
         self._last_position_heading: float | None = None
@@ -365,8 +375,13 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 ("getLifeSpan", {}),
                 ("getTotalStats", {}),
             ):
-                response = await self.api.control(self.device, command, payload)
-                state = apply_response(state, command, response)
+                try:
+                    response = await self.api.control(self.device, command, payload)
+                    state = apply_response(state, command, response)
+                except EcovacsApiError as err:
+                    _LOGGER.debug(
+                        "ECOVACS coordinator update skipped %s: %s", command, err
+                    )
         except EcovacsApiError as err:
             raise UpdateFailed(str(err)) from err
         except Exception as err:
@@ -553,6 +568,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         await asyncio.sleep(0.5)
         if not self.data or not self.data.map.mid or not self._trace_update_due:
             return
+        if not self._protocol.map_api_uses_v2:
+            return
         try:
             response = await self.api.control(
                 self.device,
@@ -687,7 +704,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             return
 
         state = await self._async_request_live_position_stream(
-            self.data or MowerState(),
+            self.data or self._base_state(),
             reason,
             force=force,
         )
@@ -736,7 +753,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 self._live_position_keepalive_until is not None
                 and monotonic() < self._live_position_keepalive_until
             ):
-                state = self.data or MowerState()
+                state = self.data or self._base_state()
                 if force or state.activity in LIVE_POSITION_STREAM_ACTIVITIES:
                     try:
                         await self._async_send_app_ping(reason)
@@ -793,7 +810,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         """Run the app-style live map stream request and merge any readbacks."""
         try:
             state = await self._async_request_live_position_stream(
-                self.data or MowerState(),
+                self.data or self._base_state(),
                 reason,
                 force=force,
             )
@@ -860,34 +877,44 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             )
             return state
 
-        await self.api.control(
-            self.device,
-            "getMapSet_V2",
-            self._app_live_map_payload(mid, "ar"),
-        )
-        previous_state = state
-        response = await self.api.control(
-            self.device,
-            "getMapTrace_V2",
-            self._app_live_map_payload(mid, MAP_TRACE_TYPE),
-        )
-        state = apply_response(state, "getMapTrace_V2", response)
-        trace_changed = self._trace_path_changed(previous_state, state)
-        if trace_changed:
-            state = self._reset_live_position_segment(state)
-            self._mark_trace_mqtt_applied()
+        trace_changed = False
+        if self._protocol.map_api_uses_v2:
+            try:
+                await self.api.control(
+                    self.device,
+                    "getMapSet_V2",
+                    self._app_live_map_payload(mid, "ar"),
+                )
+                previous_state = state
+                response = await self.api.control(
+                    self.device,
+                    "getMapTrace_V2",
+                    self._app_live_map_payload(mid, MAP_TRACE_TYPE),
+                )
+                state = apply_response(state, "getMapTrace_V2", response)
+                trace_changed = self._trace_path_changed(previous_state, state)
+                if trace_changed:
+                    state = self._reset_live_position_segment(state)
+                    self._mark_trace_mqtt_applied()
 
-        for map_type in APP_LIVE_MAP_TYPES[1:]:
-            await self.api.control(
-                self.device,
-                "getMapSet_V2",
-                self._app_live_map_payload(mid, map_type),
-            )
-        await self.api.control(
-            self.device,
-            "getMapPoint",
-            {"mid": mid, "bdTaskID": self._next_app_bd_task_id()},
-        )
+                for map_type in APP_LIVE_MAP_TYPES[1:]:
+                    await self.api.control(
+                        self.device,
+                        "getMapSet_V2",
+                        self._app_live_map_payload(mid, map_type),
+                    )
+                await self.api.control(
+                    self.device,
+                    "getMapPoint",
+                    {"mid": mid, "bdTaskID": self._next_app_bd_task_id()},
+                )
+            except EcovacsApiError as err:
+                _LOGGER.warning(
+                    "ECOVACS live map stream V2 calls failed; using position/MQTT only: %s",
+                    err,
+                )
+                self._protocol = replace(self._protocol, map_api_uses_v2=False)
+
         self._capture_event(
             "live_position_stream_requested",
             {
@@ -896,6 +923,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 "mid": mid,
                 "map_types": APP_LIVE_MAP_TYPES,
                 "trace_changed": trace_changed,
+                "map_api_uses_v2": self._protocol.map_api_uses_v2,
             },
         )
         return state
@@ -1039,10 +1067,15 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
 
     async def _async_refresh_state_groups(self) -> MowerState:
         """Refresh only the app-captured grouped state/settings payloads."""
-        state = self.data or MowerState()
+        state = self.data or self._base_state()
         for group in STARTUP_GET_INFO_GROUPS:
-            response = await self.api.control(self.device, "getInfo", list(group))
-            state = apply_response(state, "getInfo", response)
+            state, self._protocol = await apply_resilient_getinfo_group(
+                self.api,
+                self.device,
+                state,
+                group,
+                self._protocol,
+            )
         state = await self._async_refresh_live_map(state)
         self._last_readback_at = monotonic()
         return state
@@ -1051,6 +1084,13 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         """Refresh live map position and request a map trace push."""
         try:
             state = await self._async_refresh_live_position(state)
+        except EcovacsApiError as err:
+            _LOGGER.debug("ECOVACS live position refresh failed: %s", err)
+            return state
+
+        if not self._protocol.map_api_uses_v2:
+            return state
+        try:
             if state.map.mid:
                 if not state.map.info.outline:
                     map_info_payload: dict[str, Any] = {
@@ -1074,22 +1114,30 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 )
                 state = apply_response(state, "getMapTrace_V2", response)
         except EcovacsApiError as err:
-            _LOGGER.debug("ECOVACS live map refresh failed: %s", err)
+            if self._protocol.map_api_uses_v2:
+                _LOGGER.warning(
+                    "ECOVACS map V2 control API unavailable for this device; "
+                    "continuing with MQTT/position-only map updates: %s",
+                    err,
+                )
+                self._protocol = replace(self._protocol, map_api_uses_v2=False)
+            else:
+                _LOGGER.debug("ECOVACS live map refresh failed: %s", err)
         return state
 
     async def _async_refresh_live_position(self, state: MowerState) -> MowerState:
         """Refresh the mower, charger, and beacon positions."""
-        response = await self.api.control(
-            self.device, "getPos", ["chargePos", "deebotPos", "uwbPos"]
+        new_state, self._protocol = await refresh_live_position(
+            self.api, self.device, state, self._protocol
         )
-        return apply_response(state, "getPos", response)
+        return new_state
 
     async def _async_refresh_live_map_after_mqtt_start(self) -> None:
         """Request live map data after MQTT has had time to subscribe."""
         for delay in (5, 10):
             await asyncio.sleep(delay)
             self.async_set_updated_data(
-                await self._async_refresh_live_map(self.data or MowerState())
+                await self._async_refresh_live_map(self.data or self._base_state())
             )
             if self.data and self.data.map.trace.path:
                 return
@@ -1127,6 +1175,24 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             return self.hass.async_create_background_task(coro, name)
         return asyncio.create_task(coro, name=name)
 
+    def _base_state(self) -> MowerState:
+        """Return an empty cache row with static per-device fields filled in."""
+        return replace(
+            MowerState(),
+            goat_g1_variant=classify_goat_g1_variant(self.device.model),
+        )
+
+    @property
+    def protocol_profile(self) -> dict[str, Any]:
+        """Return learned protocol details for diagnostics."""
+        return {
+            **self._protocol.as_dict(),
+            "goat_g1_variant": self.data.goat_g1_variant
+            if self.data
+            else classify_goat_g1_variant(self.device.model),
+            "device_name": self.device.model,
+        }
+
     async def control(
         self,
         command: str,
@@ -1137,9 +1203,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         """Execute a command and merge the response into the cache."""
         if refresh_if_stale:
             await self.async_refresh_if_stale()
-        response = await self.api.control(
-            self.device, command, self._command_payload(command, data or {})
-        )
+        payload = self._command_payload(command, data or {})
+        response = await self.api.control(self.device, command, payload)
         self.async_set_updated_data(apply_response(self.data, command, response))
 
     async def start_mowing(self) -> None:

@@ -13,6 +13,6 @@ This repository is intentionally scoped to ECOVACS GOAT mower support. Please ke
 ## Development Checks
 
 ```bash
-python -m pytest tests/ecovacs_goat_g1/test_mower_messages.py
+python -m pytest tests/ecovacs_goat_g1/
 python -m compileall custom_components/ecovacs_goat_g1 tests/ecovacs_goat_g1
 ```

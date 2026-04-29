@@ -317,6 +317,26 @@ def test_stats_network_and_lifespan_parsing() -> None:
     assert state.stats.total_count == 131
 
 
+def test_get_robot_feature_populates_state() -> None:
+    """getRobotFeature from grouped getInfo is merged into robot_features."""
+    state = apply_response(
+        MowerState(),
+        "getInfo",
+        {
+            "body": {
+                "data": {
+                    "getRobotFeature": {
+                        "data": {"4g": 1, "gps": 0, "station": 0},
+                        "code": 0,
+                        "msg": "ok",
+                    },
+                }
+            }
+        },
+    )
+    assert state.robot_features == {"4g": 1, "gps": 0, "station": 0}
+
+
 def test_ngiot_body_code_failure_raises_api_error() -> None:
     """N-GIoT responses report command failures in body.code."""
     with pytest.raises(EcovacsApiError):

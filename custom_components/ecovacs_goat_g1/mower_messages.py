@@ -368,6 +368,9 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
                         else state.settings.safer_mode,
                     ),
                 )
+        case "getRobotFeature" | "onRobotFeature":
+            if isinstance(data, dict):
+                state = replace(state, robot_features=dict(data))
 
     raw = dict(state.raw)
     raw[command] = data
