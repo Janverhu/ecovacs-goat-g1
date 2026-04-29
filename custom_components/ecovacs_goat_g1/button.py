@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
+from homeassistant.components.persistent_notification import async_create, async_dismiss
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -19,6 +20,26 @@ BUTTONS: tuple[ButtonEntityDescription, ...] = (
     ButtonEntityDescription(
         key="end_mowing",
         name="Stop mowing",
+    ),
+    ButtonEntityDescription(
+        key="start_debug_capture",
+        name="Start debug capture",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    ButtonEntityDescription(
+        key="stop_debug_capture",
+        name="Stop debug capture",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    ButtonEntityDescription(
+        key="export_debug_capture",
+        name="Export debug capture",
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    ButtonEntityDescription(
+        key="clear_debug_capture",
+        name="Clear debug captures",
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
 )
 
@@ -55,3 +76,38 @@ class MowerButton(EcovacsMowerEntity, ButtonEntity):
                 await self.coordinator.async_refresh_state()
             case "end_mowing":
                 await self.coordinator.end_mowing()
+            case "start_debug_capture":
+                self.coordinator.debug_capture.start(reason="Started from Home Assistant UI")
+                self.coordinator.async_set_updated_data(self.coordinator.data)
+            case "stop_debug_capture":
+                self.coordinator.debug_capture.stop()
+                self.coordinator.async_set_updated_data(self.coordinator.data)
+            case "export_debug_capture":
+                export = self.coordinator.debug_capture.export_zip()
+                base_url = (
+                    self.coordinator.hass.config.external_url
+                    or self.coordinator.hass.config.internal_url
+                    or ""
+                )
+                download_url = export["url"]
+                full_url = (
+                    f"{base_url.rstrip('/')}{download_url}" if base_url else download_url
+                )
+                async_create(
+                    self.coordinator.hass,
+                    (
+                        "ECOVACS debug capture export is ready.\n\n"
+                        f"[Download capture]({full_url})\n\n"
+                        f"URL: {full_url}"
+                    ),
+                    title="ECOVACS debug capture",
+                    notification_id="ecovacs_goat_debug_capture_export",
+                )
+                self.coordinator.async_set_updated_data(self.coordinator.data)
+            case "clear_debug_capture":
+                self.coordinator.debug_capture.clear()
+                async_dismiss(
+                    self.coordinator.hass,
+                    notification_id="ecovacs_goat_debug_capture_export",
+                )
+                self.coordinator.async_set_updated_data(self.coordinator.data)

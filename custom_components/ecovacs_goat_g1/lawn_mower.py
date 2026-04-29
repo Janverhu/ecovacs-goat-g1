@@ -15,8 +15,10 @@ from . import EcovacsConfigEntry
 from .entity import EcovacsMowerEntity
 from .mower_models import MowerActivity
 
+STATE_IDLE = "idle"
+
 ACTIVITY_MAP = {
-    MowerActivity.IDLE: None,
+    MowerActivity.IDLE: STATE_IDLE,
     MowerActivity.MOWING: LawnMowerActivity.MOWING,
     MowerActivity.PAUSED: LawnMowerActivity.PAUSED,
     MowerActivity.RETURNING: LawnMowerActivity.RETURNING,
@@ -53,7 +55,7 @@ class EcovacsMower(EcovacsMowerEntity, LawnMowerEntity):
         super().__init__(coordinator, "mower")
 
     @property
-    def activity(self) -> LawnMowerActivity | None:
+    def activity(self) -> LawnMowerActivity | str | None:
         """Return mower activity."""
         return ACTIVITY_MAP[self.coordinator.data.activity]
 

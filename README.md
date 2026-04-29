@@ -34,7 +34,7 @@ That design keeps the dependency surface small and avoids repeatedly sending bro
 - Button entities: refresh state, stop mowing.
 - Sensors: battery, error, Wi-Fi diagnostics, current/total mowing stats, blade and lens brush lifespan.
 - Settings: rain sensor and delay, animal protection and time window, AI recognition, edge mowing, safer mode, warning switches, cut direction, mowing efficiency, obstacle avoidance.
-- Service: `ecovacs_goat_g1.refresh_state`, which only performs a grouped refresh when cached MQTT/readback state is stale.
+- Services: `ecovacs_goat_g1.refresh_state` for stale-only readbacks, plus opt-in debug capture services for troubleshooting unsupported models.
 - Optional Lovelace card with explicit Start/Resume, Stop, Dock, and Refresh controls.
 
 ## Branding
@@ -80,7 +80,6 @@ area_entity: sensor.mower_mowing_area
 progress_entity: sensor.mower_mowing_progress
 direction_entity: number.mower_cut_direction
 stop_button: button.mower_end_mowing
-refresh_button: button.mower_refresh_state
 name: Mower
 ```
 
@@ -97,16 +96,67 @@ The integration is intentionally conservative:
 - MQTT is used for live state and setting updates where possible.
 - Startup performs grouped `getInfo` readbacks to populate entities.
 - Commands perform a stale-only grouped refresh first if no recent MQTT/readback update was seen.
-- The refresh button forces a grouped state readback. The refresh service uses the same stale-only guard as command preflight.
-- There is no periodic polling interval.
+- The card's keepalive button starts a 10-minute app-style live-map keepalive and shows a countdown while it is active.
+- Routine live-position polling is only used as a sparse fallback when MQTT position updates are stale.
 
 This is meant to reduce load on the mower and cloud path after an earlier failure mode where the mower itself became unreachable.
+
+### Experimental App-Presence MQTT
+
+Cold-start Android captures showed that the official ECOVACS app opens two MQTT
+sessions before the map screen is shown:
+
+- An Aliyun IoT bootstrap session to `public.itls.<region>.aliyuncs.com:1883`
+  that binds an app client and subscribes to `/sys/.../app/down/#`.
+- An ECOVACS N-GIoT user/app session to
+  `jmq-ngiot-<region>.dc.robotww.ecouser.net:443`.
+
+The second session uses a client id shaped like `<uid>@USER/<realm>|...|`, a
+username built from the mower DID plus app metadata, and the normal ECOVACS
+account JWT as the password. This appears to be an app-presence signal rather
+than the same mower push channel used by the integration's normal MQTT client.
+
+The optional Lovelace card calls `ecovacs_goat_g1.request_live_position_stream`
+while it is visible and the mower is mowing or returning. During those requests,
+the integration now keeps an experimental N-GIoT app-presence MQTT connection
+open for a short TTL and lets it expire when card requests stop. The goal is to
+mimic the official app's "someone is watching the live map" presence without
+leaving the extra session connected in the background.
+
+## Debug Capture
+
+For unsupported GOAT models, start an explicit debug capture before reproducing the issue. Captures are disabled by default and are stored locally under `/config/ecovacs_goat_g1_debug/` as bounded JSONL sessions. Account tokens, user IDs, device IDs, and resource IDs are redacted; map and position payloads are kept because they are usually required for mower debugging.
+
+Recommended app-driven workflow:
+
+1. Open **Developer Tools -> Services** and call `ecovacs_goat_g1.start_debug_capture` with a short reason, for example `pressed app map button`.
+2. Perform the action in Home Assistant or the official ECOVACS app.
+3. Optionally call `ecovacs_goat_g1.mark_debug_capture` at important moments, such as after opening the app map.
+4. Call `ecovacs_goat_g1.stop_debug_capture`.
+5. Download Home Assistant diagnostics for the integration, or call `ecovacs_goat_g1.export_debug_capture` to create a zip at `/local/ecovacs_goat/debug/`.
+
+The normal capture path can record MQTT pushes received by the integration and commands sent by the integration. It cannot directly see commands sent from the official mobile app to ECOVACS unless those commands result in MQTT pushes back to this client. For true mobile-app outbound command capture, use an advanced MITM/proxy or Android packet-capture workflow outside this integration.
 
 ## Safety Notes
 
 Only use commands that have been tested with your mower in a safe outdoor state. Stop using the integration if the official ECOVACS app also loses contact with the mower, commands repeatedly time out, or the mower requires a restart to recover.
 
 The integration treats cloud payloads as JSON data. It parses known fields into Home Assistant state and stores unknown payloads as raw diagnostic data; it does not execute payload content.
+
+## Security Research Context
+
+Dennis Giese and braelynn's DEF CON 32 talk, [Reverse engineering and hacking Ecovacs robots](https://dontvacuum.me/talks/DEFCON32/DEFCON32_reveng_hacking_ecovacs_robots.pdf), covers multiple Ecovacs robots, including the GOAT G1. The talk is not documentation for the cloud APIs used here, but it is useful context for how this integration should behave.
+
+Relevant takeaways for this project:
+
+- The GOAT G1 is described as a Linux-based robot with cameras, ToF, UWB beacons, optional LTE, Rockchip RK3588-class hardware, and multiple MCUs. Treat it as a capable networked computer, not a simple appliance.
+- The official mobile app and robots are chatty. The talk calls out telemetry such as live coordinates, Wi-Fi/network data, maps, stuck-state data, and possibly images on supported models. This supports the integration's conservative design: prefer MQTT pushes, avoid broad polling loops, and keep debug capture opt-in and redacted.
+- The Ecovacs app uses a native shell plus dynamically downloaded robot-specific plugin code. That matches our reverse-engineering experience: behavior can differ by model/plugin/app version, so captured app behavior should be documented with context and not assumed universal.
+- The talk reports TLS and plugin weaknesses in parts of the Ecovacs ecosystem. For our work, this is a reminder to avoid capture workflows on untrusted networks and to treat app/session tokens as highly sensitive.
+- It reports GOAT/lawnmower-specific BLE provisioning risks and a GOAT G1 BLE RCE demonstration. This integration does not use BLE, does not root the mower, and should not add local provisioning/control paths without a separate security review.
+- It also discusses cloud/device data retention and used-device risks. Users should remove shared account access, change passwords when ownership changes, factory-reset before disposal, and understand that a factory reset may not erase all data from flash.
+
+The practical policy for this integration remains: use only the minimum cloud/MQTT behavior needed for mower entities and the optional visible-card live map, do not expose camera/live video features, do not store unredacted credentials in diagnostics, and do not attempt firmware, root, BLE, or local-device modification workflows.
 
 ## Dependencies
 

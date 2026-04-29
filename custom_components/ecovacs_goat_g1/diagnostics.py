@@ -31,5 +31,9 @@ async def async_get_config_entry_diagnostics(
         async_redact_data(device, REDACT_DEVICE)
         for device in controller.devices
     ]
+    diag["debug_capture"] = {
+        "summary": controller.debug_capture.summary(),
+        "recent_events": controller.debug_capture.recent_events(limit=100),
+    }
 
     return diag

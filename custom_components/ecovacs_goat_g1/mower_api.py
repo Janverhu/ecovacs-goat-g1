@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from aiohttp import ClientError, ClientResponseError, ClientSession, ClientTimeout
 
+from .debug_capture import DebugCaptureStore
 from .mower_models import MowerDevice
 
 REALM = "ecouser.net"
@@ -127,6 +128,7 @@ class EcovacsMowerApi:
         password: str,
         country: str,
         device_id: str,
+        debug_capture: DebugCaptureStore | None = None,
     ) -> None:
         self._session = session
         self._username = username
@@ -136,6 +138,7 @@ class EcovacsMowerApi:
         self._continent = country_continent(self._country)
         self._credentials: Credentials | None = None
         self._sst: dict[str, SstToken] = {}
+        self._debug_capture = debug_capture
 
         postfix = "" if self._country == COUNTRY_CHINA else f"-{self._continent}"
         country_lower = self._country.lower()
@@ -223,6 +226,17 @@ class EcovacsMowerApi:
             "content-type": "application/octet-stream",
             "user-agent": "okhttp/4.9.1",
         }
+        started = time.monotonic()
+        self._capture_control_event(
+            "api_control_request",
+            device,
+            command,
+            {
+                "request_id": request_id,
+                "params": params,
+                "request": payload,
+            },
+        )
         try:
             async with self._session.post(
                 url,
@@ -233,10 +247,70 @@ class EcovacsMowerApi:
             ) as response:
                 response.raise_for_status()
                 result: dict[str, Any] = await response.json(content_type=None)
-                _raise_for_control_error(command, result)
+                try:
+                    _raise_for_control_error(command, result)
+                except EcovacsApiError as err:
+                    self._capture_control_event(
+                        "api_control_error",
+                        device,
+                        command,
+                        {
+                            "request_id": request_id,
+                            "duration_ms": round(
+                                (time.monotonic() - started) * 1000
+                            ),
+                            "response": result,
+                            "exception": repr(err),
+                        },
+                    )
+                    raise
+                self._capture_control_event(
+                    "api_control_response",
+                    device,
+                    command,
+                    {
+                        "request_id": request_id,
+                        "duration_ms": round((time.monotonic() - started) * 1000),
+                        "response": result,
+                    },
+                )
                 return result
         except ClientError as err:
+            self._capture_control_event(
+                "api_control_error",
+                device,
+                command,
+                {
+                    "request_id": request_id,
+                    "duration_ms": round((time.monotonic() - started) * 1000),
+                    "exception": repr(err),
+                },
+            )
             raise EcovacsApiError(f"Control command {command} failed") from err
+
+    def _capture_control_event(
+        self,
+        event_type: str,
+        device: MowerDevice,
+        command: str,
+        data: dict[str, Any],
+    ) -> None:
+        """Write a debug capture control event if capture is active."""
+        if self._debug_capture is None:
+            return
+        self._debug_capture.capture_event(
+            event_type,
+            {
+                "command": command,
+                "device": {
+                    "did": device.did,
+                    "class": device.device_class,
+                    "resource": device.resource,
+                    "model": device.model,
+                },
+                **data,
+            },
+        )
 
     async def _sst_token(self, device: MowerDevice) -> SstToken:
         cached = self._sst.get(device.did)
@@ -389,8 +463,13 @@ def app_payload(data: Any) -> dict[str, Any]:
     }
 
 
-def _raise_for_control_error(command: str, result: dict[str, Any]) -> None:
+def _raise_for_control_error(command: str, result: Any) -> None:
     """Raise when ECOVACS reports a failed N-GIoT control response."""
+    if result is None and command == "appping":
+        return
+    if not isinstance(result, dict):
+        raise EcovacsApiError(f"Control command {command} returned {result!r}")
+
     if "ret" in result and result["ret"] != "ok":
         raise EcovacsApiError(f"Control command {command} returned {result!r}")
 

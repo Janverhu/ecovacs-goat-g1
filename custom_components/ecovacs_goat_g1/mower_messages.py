@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 from dataclasses import replace
 import json
+import lzma
 from typing import Any
 
 from .mower_models import (
+    MapPosition,
     MowerActivity,
+    MowerMap,
+    MowerMapInfo,
+    MowerMapTrace,
     MowerSettings,
     MowerState,
     MowerStats,
@@ -27,12 +34,17 @@ OBSTACLE_AVOIDANCE_BY_LEVEL = {
 OBSTACLE_AVOIDANCE_LEVELS = {
     value: key for key, value in OBSTACLE_AVOIDANCE_BY_LEVEL.items()
 }
-
 ERROR_DESCRIPTIONS = {
     0: "NoError: Robot is operational",
     100: "NoError: Robot is operational",
+    422: "Weak signal, back to station",
     4200: "Robot not reachable",
     500: "Request Timeout",
+}
+RETURN_TO_STATION_ERROR_CODES = {422}
+POSITION_HISTORY_ACTIVITIES = {
+    MowerActivity.MOWING,
+    MowerActivity.RETURNING,
 }
 
 
@@ -90,7 +102,10 @@ def apply_response(state: MowerState, command: str, response: dict[str, Any]) ->
 def apply_mqtt_payload(state: MowerState, topic: str, payload: str | bytes | bytearray) -> MowerState:
     """Apply an MQTT push payload to cached state."""
     command = topic.split("/")[2] if "/" in topic else topic
-    data = body_data(decode_payload(payload))
+    message = decode_payload(payload)
+    data = body_data(message)
+    if isinstance(data, dict):
+        data = {**data, "_mqtt_ts": (message.get("header") or {}).get("ts")}
     return apply_command_data(state, command, data)
 
 
@@ -119,19 +134,51 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
         case "getCleanInfo_V2" | "onCleanInfo_V2" | "getCleanInfo" | "onCleanInfo":
             if isinstance(data, dict):
                 activity = _clean_activity(data, state.activity)
+                if (
+                    activity is MowerActivity.PAUSED
+                    and (
+                        state.activity is MowerActivity.RETURNING
+                        or state.error_code in RETURN_TO_STATION_ERROR_CODES
+                    )
+                ):
+                    activity = MowerActivity.RETURNING
+                mower_map = state.map
+                if (
+                    activity is MowerActivity.MOWING
+                    and state.activity
+                    not in {
+                        MowerActivity.UNKNOWN,
+                        MowerActivity.MOWING,
+                        MowerActivity.PAUSED,
+                    }
+                ):
+                    mower_map = replace(mower_map, position_history=())
                 state = replace(
                     state,
                     activity=activity,
                     charging=False if activity is MowerActivity.MOWING else state.charging,
                     task_id=_task_id(data, state.task_id),
+                    map=mower_map,
                 )
         case "onWorkState" | "getWorkState":
             if isinstance(data, dict):
                 activity = _work_state_activity(data, state.activity)
+                mower_map = state.map
+                if (
+                    activity is MowerActivity.MOWING
+                    and state.activity
+                    not in {
+                        MowerActivity.UNKNOWN,
+                        MowerActivity.MOWING,
+                        MowerActivity.PAUSED,
+                    }
+                ):
+                    mower_map = replace(mower_map, position_history=())
                 state = replace(
                     state,
                     activity=activity,
                     charging=False if activity is MowerActivity.MOWING else state.charging,
+                    map=mower_map,
                 )
         case "getStats" | "onStats" | "reportStats":
             if isinstance(data, dict):
@@ -170,8 +217,27 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
                     state,
                     error_code=code,
                     error_description=ERROR_DESCRIPTIONS.get(code or 0),
-                    activity=MowerActivity.ERROR if code not in (None, 0, 100) else state.activity,
+                    activity=_error_activity(code, state),
                 )
+        case "getPos" | "onPos":
+            if isinstance(data, dict):
+                state = replace(
+                    state,
+                    map=_map_position_data(
+                        state.map,
+                        data,
+                        record_history=state.activity in POSITION_HISTORY_ACTIVITIES,
+                    ),
+                )
+        case "getUWB" | "onUWB":
+            if isinstance(data, dict):
+                state = replace(state, map=_map_uwb_data(state.map, data))
+        case "getMapTrace_V2" | "onMapTrace_V2":
+            if isinstance(data, dict):
+                state = replace(state, map=_map_trace_data(state.map, data))
+        case "getMapInfo_V2" | "onMapInfo_V2":
+            if isinstance(data, dict):
+                state = replace(state, map=_map_info_data(state.map, data))
         case "getWifiList" | "onWifiList":
             if isinstance(data, dict):
                 first = next(iter(data.get("list", []) or []), {})
@@ -350,6 +416,263 @@ def _work_state_activity(data: dict[str, Any], current: MowerActivity) -> MowerA
     if robot_state == "idle" and station_state == "idle":
         return MowerActivity.IDLE
     return current
+
+
+def _error_activity(code: int | None, state: MowerState) -> MowerActivity:
+    """Return activity implied by an error payload."""
+    if code in (None, 0, 100):
+        return state.activity
+    if code in RETURN_TO_STATION_ERROR_CODES:
+        if state.charging is True or state.activity is MowerActivity.DOCKED:
+            return MowerActivity.DOCKED
+        return MowerActivity.RETURNING
+    return MowerActivity.ERROR
+
+
+def _map_position_data(
+    current: MowerMap, data: dict[str, Any], *, record_history: bool
+) -> MowerMap:
+    """Merge mower, station, and beacon positions into the map cache."""
+    mower_position = _map_position(data.get("deebotPos"))
+    charge_positions = _map_positions(data.get("chargePos"))
+    uwb_positions = _map_positions(data.get("uwbPos"))
+    history = current.position_history
+
+    if record_history and mower_position and mower_position.invalid != 1:
+        if not history or (
+            history[-1].x != mower_position.x or history[-1].y != mower_position.y
+        ):
+            history = (*history, mower_position)
+
+    return replace(
+        current,
+        mid=str(data.get("mid")) if data.get("mid") is not None else current.mid,
+        current_position=mower_position or current.current_position,
+        charge_positions=charge_positions or current.charge_positions,
+        uwb_positions=uwb_positions or current.uwb_positions,
+        position_history=history,
+        last_update_ts=_int(data.get("_mqtt_ts")) or current.last_update_ts,
+        revision=current.revision + 1,
+    )
+
+def _map_uwb_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
+    """Merge beacon position data from getUWB/onUWB payloads."""
+    uwb_positions = _map_positions(data.get("uwbPos"))
+    if uwb_positions and not any(
+        position.x != 0 or position.y != 0 for position in uwb_positions
+    ):
+        uwb_positions = ()
+
+    return replace(
+        current,
+        mid=str(data.get("mid")) if data.get("mid") is not None else current.mid,
+        uwb_positions=uwb_positions or current.uwb_positions,
+        last_update_ts=_int(data.get("_mqtt_ts")) or current.last_update_ts,
+    )
+
+
+def _map_trace_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
+    """Merge chunked onMapTrace_V2 data into the map cache."""
+    batch_id = str(data.get("batid")) if data.get("batid") is not None else None
+    serial = str(data.get("serial")) if data.get("serial") is not None else None
+    trace_type = str(data.get("type")) if data.get("type") is not None else None
+    index = _int(data.get("index"))
+    info = data.get("info")
+
+    trace = current.trace
+    if (
+        batch_id
+        and (
+            trace.batch_id != batch_id
+            or trace.serial != serial
+            or trace.type != trace_type
+        )
+    ):
+        trace = MowerMapTrace(batch_id=batch_id, serial=serial, type=trace_type)
+
+    chunks = dict(trace.chunks)
+    if index is not None and isinstance(info, str):
+        chunks[index] = info
+    path = _decode_trace_path(chunks) or trace.path
+
+    return replace(
+        current,
+        mid=str(data.get("mid")) if data.get("mid") is not None else current.mid,
+        trace=replace(
+            trace,
+            batch_id=batch_id or trace.batch_id,
+            serial=serial or trace.serial,
+            info_size=_int(data.get("infoSize")) or trace.info_size,
+            type=trace_type or trace.type,
+            chunks=chunks,
+            path=path,
+        ),
+        last_update_ts=_int(data.get("_mqtt_ts")) or current.last_update_ts,
+        revision=current.revision + 1,
+    )
+
+
+def _map_info_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
+    """Merge chunked onMapInfo_V2 data into the base map cache."""
+    batch_id = str(data.get("batid")) if data.get("batid") is not None else None
+    serial = str(data.get("serial")) if data.get("serial") is not None else None
+    map_type = str(data.get("type")) if data.get("type") is not None else None
+    index = _int(data.get("index"))
+    info = data.get("info")
+
+    map_info = current.info
+    if (
+        batch_id
+        and (
+            map_info.batch_id != batch_id
+            or map_info.serial != serial
+            or map_info.type != map_type
+        )
+    ):
+        map_info = MowerMapInfo(batch_id=batch_id, serial=serial, type=map_type)
+
+    chunks = dict(map_info.chunks)
+    if index is not None and isinstance(info, str):
+        chunks[index] = info
+
+    outline, obstacles = _decode_base_map(chunks)
+
+    return replace(
+        current,
+        mid=str(data.get("mid")) if data.get("mid") is not None else current.mid,
+        info=replace(
+            map_info,
+            batch_id=batch_id or map_info.batch_id,
+            serial=serial or map_info.serial,
+            info_size=_int(data.get("infoSize")) or map_info.info_size,
+            type=map_type or map_info.type,
+            chunks=chunks,
+            outline=outline or map_info.outline,
+            obstacles=obstacles or map_info.obstacles,
+        ),
+        last_update_ts=_int(data.get("_mqtt_ts")) or current.last_update_ts,
+    )
+
+
+def _map_position(data: Any) -> MapPosition | None:
+    if not isinstance(data, dict):
+        return None
+    return MapPosition.from_payload(data)
+
+
+def _map_positions(data: Any) -> tuple[MapPosition, ...]:
+    if not isinstance(data, list):
+        return ()
+    return tuple(
+        position
+        for item in data
+        if (position := _map_position(item)) is not None and position.invalid != 1
+    )
+
+
+def _decode_trace_path(chunks: dict[int, str]) -> tuple[MapPosition, ...]:
+    """Decode ECOVACS' chunked LZMA-wrapped live trace path."""
+    try:
+        payload = _decode_lzma_json_chunks(chunks)
+    except (binascii.Error, ValueError, lzma.LZMAError, json.JSONDecodeError):
+        return ()
+
+    positions: list[MapPosition] = []
+    if not isinstance(payload, list):
+        return ()
+    for item in payload:
+        if not isinstance(item, list) or len(item) < 2 or not isinstance(item[1], str):
+            continue
+        for coordinates in item[1].split(";")[1:]:
+            if "," not in coordinates:
+                continue
+            x_value, y_value, *_ = coordinates.split(",")
+            try:
+                positions.append(MapPosition(x=int(x_value), y=int(y_value)))
+            except ValueError:
+                continue
+    return tuple(positions)
+
+
+def _decode_base_map(
+    chunks: dict[int, str],
+) -> tuple[tuple[MapPosition, ...], tuple[tuple[MapPosition, ...], ...]]:
+    """Decode ECOVACS' base map into lawn outline and obstacle polygons."""
+    try:
+        payload = _decode_lzma_json_chunks(chunks)
+    except (binascii.Error, ValueError, lzma.LZMAError, json.JSONDecodeError):
+        return (), ()
+
+    if not isinstance(payload, list):
+        return (), ()
+
+    outline_candidates: list[tuple[MapPosition, ...]] = []
+    obstacles: list[tuple[MapPosition, ...]] = []
+
+    for item in payload:
+        if not isinstance(item, list) or not item:
+            continue
+        layer = str(item[0])
+        if layer in {"1", "2"} and len(item) > 1 and isinstance(item[1], str):
+            positions = _positions_from_coordinate_string(item[1])
+            if positions:
+                outline_candidates.append(positions)
+        elif layer == "3":
+            for obstacle_data in item[1:]:
+                if isinstance(obstacle_data, str):
+                    obstacle = _positions_from_coordinate_string(obstacle_data)
+                    if len(obstacle) >= 3:
+                        obstacles.append(obstacle)
+
+    outline = max(outline_candidates, key=len, default=())
+    return outline, tuple(obstacles)
+
+
+def _decode_lzma_json_chunks(chunks: dict[int, str]) -> Any:
+    """Decode ECOVACS' compact LZMA chunk wrapper into JSON."""
+    if not chunks:
+        raise ValueError("No chunks")
+    indexes = sorted(chunks)
+    if indexes != list(range(indexes[-1] + 1)):
+        raise ValueError("Incomplete chunks")
+    raw = b"".join(base64.b64decode(chunks[index]) for index in indexes)
+    if len(raw) < 10:
+        raise ValueError("Chunk payload too small")
+    props = raw[0]
+    lc = props % 9
+    remainder = props // 9
+    lp = remainder % 5
+    pb = remainder // 5
+    decompressor = lzma.LZMADecompressor(
+        format=lzma.FORMAT_RAW,
+        filters=[
+            {
+                "id": lzma.FILTER_LZMA1,
+                "dict_size": int.from_bytes(raw[1:5], "little"),
+                "lc": lc,
+                "lp": lp,
+                "pb": pb,
+            }
+        ],
+    )
+    decoded = decompressor.decompress(
+        raw[9:], max_length=int.from_bytes(raw[5:9], "little")
+    )
+    return json.loads(decoded)
+
+
+def _positions_from_coordinate_string(value: str) -> tuple[MapPosition, ...]:
+    """Parse semicolon-delimited ECOVACS map coordinates."""
+    positions: list[MapPosition] = []
+    for coordinates in value.split(";")[1:]:
+        parts = coordinates.split(",")
+        if len(parts) < 2:
+            continue
+        try:
+            positions.append(MapPosition(x=int(parts[0]), y=int(parts[1])))
+        except ValueError:
+            continue
+    return tuple(positions)
 
 
 def _bool(value: Any) -> bool | None:

@@ -20,6 +20,18 @@
       }
     }
   },
+  "options": {
+    "step": {
+      "init": {
+        "description": "{warning}",
+        "data": {
+          "debug_capture_raw_payloads": "Include raw payloads in debug captures",
+          "debug_capture_max_duration_minutes": "Maximum capture duration",
+          "debug_capture_max_size_mb": "Maximum capture size"
+        }
+      }
+    }
+  },
   "entity": {
     "number": {
       "cut_direction": {
@@ -55,6 +67,26 @@
       },
       "network_ssid": {
         "name": "Wi-Fi SSID"
+      },
+      "live_map": {
+        "name": "Live map"
+      },
+      "debug_capture": {
+        "name": "Debug capture",
+        "state_attributes": {
+          "active_session": {
+            "name": "Active session"
+          },
+          "retained_sessions": {
+            "name": "Retained sessions"
+          },
+          "latest_download_url": {
+            "name": "Latest download URL"
+          },
+          "latest_export_session": {
+            "name": "Latest export session"
+          }
+        }
       },
       "stats_area": {
         "name": "Area mowed"
@@ -123,6 +155,18 @@
       },
       "refresh_state": {
         "name": "Refresh state"
+      },
+      "start_debug_capture": {
+        "name": "Start debug capture"
+      },
+      "stop_debug_capture": {
+        "name": "Stop debug capture"
+      },
+      "export_debug_capture": {
+        "name": "Export debug capture"
+      },
+      "clear_debug_capture": {
+        "name": "Clear debug captures"
       }
     }
   }

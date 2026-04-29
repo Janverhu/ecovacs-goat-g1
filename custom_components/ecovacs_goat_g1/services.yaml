@@ -4,3 +4,107 @@ refresh_state:
   target:
     entity:
       integration: ecovacs_goat_g1
+
+request_live_position_stream:
+  name: Request live position stream
+  description: Request app-style fast live position updates while a live map is being viewed.
+  target:
+    entity:
+      integration: ecovacs_goat_g1
+  fields:
+    reason:
+      name: Reason
+      description: Optional note describing why the live stream was requested.
+      selector:
+        text:
+    force:
+      name: Force
+      description: Allow an explicit visible-card action to request fresh live-map data even when the mower is no longer reporting mowing.
+      default: false
+      selector:
+        boolean:
+    duration_seconds:
+      name: Duration
+      description: Optional keepalive duration. When set, Home Assistant keeps the app-style map session alive for this many seconds instead of doing a one-shot refresh.
+      selector:
+        number:
+          min: 1
+          max: 3600
+          mode: box
+          unit_of_measurement: s
+
+start_debug_capture:
+  name: Start debug capture
+  description: Start an opt-in redacted ECOVACS debug capture session.
+  target:
+    entity:
+      integration: ecovacs_goat_g1
+  fields:
+    reason:
+      name: Reason
+      description: Optional note describing the workflow being captured.
+      selector:
+        text:
+    include_raw_payloads:
+      name: Include raw payloads
+      description: Include redacted raw MQTT/API payload bodies.
+      selector:
+        boolean:
+    duration_minutes:
+      name: Duration
+      description: Maximum capture duration in minutes.
+      selector:
+        number:
+          min: 1
+          max: 120
+          mode: box
+          unit_of_measurement: min
+    max_size_mb:
+      name: Maximum size
+      description: Maximum capture session size in MB.
+      selector:
+        number:
+          min: 1
+          max: 100
+          mode: box
+          unit_of_measurement: MB
+
+stop_debug_capture:
+  name: Stop debug capture
+  description: Stop an active ECOVACS debug capture session.
+  target:
+    entity:
+      integration: ecovacs_goat_g1
+
+clear_debug_capture:
+  name: Clear debug captures
+  description: Remove all local ECOVACS debug capture sessions and exported zips.
+  target:
+    entity:
+      integration: ecovacs_goat_g1
+
+mark_debug_capture:
+  name: Mark debug capture
+  description: Add a timestamped marker to the active ECOVACS debug capture.
+  target:
+    entity:
+      integration: ecovacs_goat_g1
+  fields:
+    message:
+      name: Message
+      required: true
+      selector:
+        text:
+
+export_debug_capture:
+  name: Export debug capture
+  description: Zip the latest ECOVACS debug capture into /local/ecovacs_goat/debug/.
+  target:
+    entity:
+      integration: ecovacs_goat_g1
+  fields:
+    session_id:
+      name: Session ID
+      description: Optional capture session to export. If omitted, the latest session is used.
+      selector:
+        text:

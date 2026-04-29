@@ -73,17 +73,15 @@ SENSORS: tuple[MowerSensorDescription, ...] = (
     MowerSensorDescription(
         key="stats_area",
         name="Area mowed",
-        value_fn=lambda state: state.stats.area,
-        native_unit_of_measurement=UnitOfArea.SQUARE_CENTIMETERS,
-        suggested_unit_of_measurement=UnitOfArea.SQUARE_METERS,
+        value_fn=lambda state: _area_square_meters(state.stats.area),
+        native_unit_of_measurement=UnitOfArea.SQUARE_METERS,
         device_class=SensorDeviceClass.AREA,
     ),
     MowerSensorDescription(
         key="stats_job_area",
         name="Mowing area",
-        value_fn=lambda state: state.stats.job_area,
-        native_unit_of_measurement=UnitOfArea.SQUARE_CENTIMETERS,
-        suggested_unit_of_measurement=UnitOfArea.SQUARE_METERS,
+        value_fn=lambda state: _area_square_meters(state.stats.job_area),
+        native_unit_of_measurement=UnitOfArea.SQUARE_METERS,
         device_class=SensorDeviceClass.AREA,
     ),
     MowerSensorDescription(
@@ -101,11 +99,19 @@ SENSORS: tuple[MowerSensorDescription, ...] = (
         device_class=SensorDeviceClass.DURATION,
     ),
     MowerSensorDescription(
+        key="live_map",
+        name="Live map",
+        value_fn=lambda state: "live"
+        if state.map.current_position or state.map.trace.chunks
+        else None,
+        attr_fn=lambda state: state.map.as_dict(),
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MowerSensorDescription(
         key="total_stats_area",
         name="Total area mowed",
-        value_fn=lambda state: state.stats.total_area,
-        native_unit_of_measurement=UnitOfArea.SQUARE_CENTIMETERS,
-        suggested_unit_of_measurement=UnitOfArea.SQUARE_METERS,
+        value_fn=lambda state: _area_square_meters(state.stats.total_area),
+        native_unit_of_measurement=UnitOfArea.SQUARE_METERS,
         state_class=SensorStateClass.TOTAL_INCREASING,
         device_class=SensorDeviceClass.AREA,
     ),
@@ -141,17 +147,27 @@ SENSORS: tuple[MowerSensorDescription, ...] = (
 )
 
 
+def _area_square_meters(value: int | None) -> float | None:
+    """Convert ECOVACS area values from cm2 to m2 for HA unit conversion."""
+    return None if value is None else value / 10000
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: EcovacsConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Add mower sensors."""
-    async_add_entities(
+    entities = [
         MowerSensor(coordinator, description)
         for coordinator in config_entry.runtime_data.coordinators
         for description in SENSORS
+    ]
+    entities.extend(
+        DebugCaptureSensor(coordinator)
+        for coordinator in config_entry.runtime_data.coordinators
     )
+    async_add_entities(entities)
 
 
 class MowerSensor(EcovacsMowerEntity, SensorEntity):
@@ -177,3 +193,31 @@ class MowerSensor(EcovacsMowerEntity, SensorEntity):
         if self.entity_description.attr_fn is None:
             return None
         return self.entity_description.attr_fn(self.coordinator.data)
+
+
+class DebugCaptureSensor(EcovacsMowerEntity, SensorEntity):
+    """Expose debug capture status and download URL."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_name = "Debug capture"
+
+    def __init__(self, coordinator) -> None:
+        """Initialize debug capture sensor."""
+        super().__init__(coordinator, "debug_capture")
+
+    @property
+    def native_value(self) -> str:
+        """Return capture status."""
+        return "active" if self.coordinator.debug_capture.is_active else "inactive"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return capture summary and latest download URL."""
+        summary = self.coordinator.debug_capture.summary()
+        last_export = summary.get("last_export") or {}
+        return {
+            "active_session": summary.get("active"),
+            "retained_sessions": summary.get("sessions", []),
+            "latest_download_url": last_export.get("url"),
+            "latest_export_session": last_export.get("session_id"),
+        }

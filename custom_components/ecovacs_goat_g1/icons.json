@@ -33,6 +33,9 @@
       "network_ssid": {
         "default": "mdi:wifi"
       },
+      "live_map": {
+        "default": "mdi:map"
+      },
       "station_state": {
         "default": "mdi:home"
       },
