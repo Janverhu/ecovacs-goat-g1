@@ -9,6 +9,7 @@ htmlcov/
 
 # Virtual environments
 .venv/
+.venv-*/
 venv/
 env/
 
@@ -32,6 +33,9 @@ known_devices.yaml
 *.mitm
 *.har
 *.log
+
+# pre-commit (Trivy Docker hook cache)
+.pre-commit-trivy-cache/
 
 # Editor / OS
 .vscode/

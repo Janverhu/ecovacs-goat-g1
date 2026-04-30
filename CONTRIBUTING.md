@@ -16,3 +16,15 @@ This repository is intentionally scoped to ECOVACS GOAT mower support. Please ke
 python -m pytest tests/ecovacs_goat_g1/
 python -m compileall custom_components/ecovacs_goat_g1 tests/ecovacs_goat_g1
 ```
+
+## Pre-commit
+
+Hooks run **gitleaks** (secrets), **semgrep** (static analysis), and **Trivy** filesystem scans in Docker, **pip-audit** on `requirements-audit.txt` (Python CVEs), plus basic whitespace fixes. **Docker** is required for those scanners (Semgrep does not publish a supported Windows wheel). Install [pre-commit](https://pre-commit.com) and Docker, then:
+
+```bash
+pip install pre-commit
+pre-commit install
+pre-commit run --all-files
+```
+
+To skip a hook once (e.g. Docker not running): `SKIP=gitleaks-docker,semgrep-docker,trivyfs-docker git commit -m "..."` (comma-separated hook ids).

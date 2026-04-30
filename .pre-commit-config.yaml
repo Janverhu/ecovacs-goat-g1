@@ -1,0 +1,58 @@
+# https://pre-commit.com
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+#
+# Tooling: gitleaks-docker (secrets), semgrep-docker (SAST), trivyfs-docker (vulns),
+# pip-audit (Python CVEs; closest analogue here to npm audit — there is no package.json).
+# Docker is required for the three *-docker hooks (Semgrep has no Windows wheel).
+
+default_install_hook_types: [pre-commit]
+default_stages: [pre-commit]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks-docker
+        entry: zricethezav/gitleaks:v8.30.1
+        args: [git, --pre-commit, --redact, --staged, --verbose]
+
+  - repo: https://github.com/semgrep/semgrep
+    rev: v1.99.0
+    hooks:
+      - id: semgrep-docker
+        entry: -e SEMGREP_LOG_FILE=/tmp/out.log -e SEMGREP_VERSION_CACHE_PATH=/tmp/cache returntocorp/semgrep:1.99.0 semgrep
+        args:
+          - --config
+          - auto
+          - --error
+          - --disable-version-check
+          - --quiet
+          - --skip-unknown-extensions
+
+  - repo: https://github.com/pypa/pip-audit
+    rev: v2.10.0
+    hooks:
+      - id: pip-audit
+        args: ["-r", "requirements-audit.txt"]
+
+  - repo: https://github.com/mxab/pre-commit-trivy
+    rev: v0.18.0
+    hooks:
+      - id: trivyfs-docker
+        args:
+          - --skip-dirs
+          - .venv,.venv-ci,.venv-pc,venv,env,.git,.pytest_cache,__pycache__,.ruff_cache,.mypy_cache
+          - --scanners
+          - vuln
+          - --timeout
+          - 15m
+          - --severity
+          - HIGH,CRITICAL
+          - .

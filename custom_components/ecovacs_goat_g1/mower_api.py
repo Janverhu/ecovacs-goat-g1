@@ -22,9 +22,11 @@ PATH_API_USERS_USER = "users/user.do"
 PATH_API_APPSVR_APP = "appsvr/app.do"
 
 CLIENT_KEY = "1520391301804"
-CLIENT_SECRET = "6c319b2a5cd3e66e39159c2e28f2fce9"
+# Vendor app OAuth client secret (embedded in official Ecovacs app; not a user credential).
+CLIENT_SECRET = "6c319b2a5cd3e66e39159c2e28f2fce9"  # nosemgrep
 AUTH_CLIENT_KEY = "1520391491841"
-AUTH_CLIENT_SECRET = "77ef58ce3afbe337da74aa8c5ab963a9"
+# Same as above for the auth-code client.
+AUTH_CLIENT_SECRET = "77ef58ce3afbe337da74aa8c5ab963a9"  # nosemgrep
 GLOBAL_AUTHCODE_PATH = "/v1/global/auth/getAuthCode"
 USER_LOGIN_PATH_FORMAT = (
     "/v1/private/{country}/{lang}/{deviceId}/{appCode}/{appVersion}/"

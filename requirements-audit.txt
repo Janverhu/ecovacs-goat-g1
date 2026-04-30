@@ -1,0 +1,5 @@
+# Dependency tree audited by pre-commit (pip-audit). Align with
+# custom_components/ecovacs_goat_g1/manifest.json and .github/workflows/validate.yml.
+paho-mqtt==2.1.0
+pytest
+aiohttp

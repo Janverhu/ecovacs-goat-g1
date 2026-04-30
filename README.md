@@ -65,7 +65,7 @@ To install it:
 /local/ecovacs_goat/ecovacs-goat-card.js
 ```
 
-After the resource is loaded, add **Ecovacs GOAT Card** from the custom card picker.
+After the resource is loaded, add **Ecovacs GOAT Card** from the custom card picker. The card’s **keepalive** control starts a timed **`request_live_position_stream`** session so the mower behaves as if the official app map is open (MQTT-heavy updates). How that fits with the trace outline and the 60 second fallback is explained under **How It Behaves** below.
 
 Example YAML:
 
@@ -85,10 +85,21 @@ name: Mower
 
 The integration tries to be conservative with the mower and cloud connection:
 
-- It prefers live updates pushed by ECOVACS.
-- It refreshes state at startup and when data is stale.
+- It prefers live updates pushed by ECOVACS over MQTT.
+- It refreshes grouped state at startup and after meaningful MQTT changes (with a short debounced readback).
 - It avoids broad background polling loops.
-- The card can request a short live-map session while the map is visible.
+
+### Live map: position line, completed outline, and keepalive
+
+The map is built from two layers that update at different rates:
+
+1. **Completed mowing outline (trace)** — A path from the mower cloud (`getMapTrace_V2`) or from MQTT `onMapTrace_V2`. It shows where the mower has already cut. Trace payloads are relatively heavy, so the integration **throttles** them: **MQTT trace pushes are ignored until enough heading change has accumulated from live position updates** (about **90°** in total, using the mower’s reported heading and/or the direction of travel between consecutive points, with a small minimum move distance so noise does not open the gate). When that threshold is reached, the integration schedules a trace refresh and accepts new trace data. **If `onPos` never arrives**, that heading gate never advances from turns alone, so while **mowing** the integration also **refreshes the trace on the same slow cloud poll** it uses for position when MQTT has gone stale (about **every 60 seconds**).
+
+2. **The “last line” / in-progress segment** — While **mowing**, the integration keeps a short polyline of recent **positions** (`position_history`): ideally one point per MQTT **`onPos`** message. If **`onPos` has been quiet for about 60 seconds**, a background task asks the cloud for **`getPos`** instead. When a new trace snapshot is applied, that live segment is **reset** so the stored outline and the line still being drawn stay aligned.
+
+**Keepalive (“someone is watching the map”)** — In the official app, opening the live map nudges the cloud and mower toward **faster `onPos`** and related map traffic. Home Assistant does not do that continuously. The service **`ecovacs_goat_g1.request_live_position_stream`** asks ECOVACS for an **app-style map session** (map set, trace, map point) and, when you pass **`duration_seconds`**, keeps a **keepalive window** open: a background loop sends **`appping`**, repeats the stream request, and keeps **app-presence MQTT** active so the mower treats the session like an open app map. The optional **Ecovacs GOAT** card starts this for you (default **10 minutes** per activation) and passes **`force: true`**, which bypasses the coordinator’s usual spacing on stream requests so the loop can stay aggressive while the window runs. **While MQTT `onPos` is flowing**, the moving dot and the live segment update from those pushes, and accumulated heading opens the **trace** gate after turns. If **`onPos` stops** (no keepalive and no mower pushes), updates fall back to the **~60 second** mowing poll for both position and trace, which keeps the map roughly current but not smoothly animated.
+
+Constants such as the 90° gate, 60 second stale interval, and stream request spacing live in `mower_coordinator.py` if you need exact values.
 
 For technical protocol notes, see `docs/protocol-summary.md`.
 
