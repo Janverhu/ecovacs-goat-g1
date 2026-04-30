@@ -514,7 +514,7 @@ def sign_params(
 
 def md5(value: str) -> str:
     """MD5 hex digest for ECOVACS API compatibility (vendor signing and password wire format)."""
-    # codeql[py/weak-sensitive-data-hashing]: MD5 is mandated by the ECOVACS cloud protocol, not chosen for local credential storage.
+    # codeql[py/weak-sensitive-data-hashing]
     return hashlib.md5(value.encode(), usedforsecurity=False).hexdigest()
 
 

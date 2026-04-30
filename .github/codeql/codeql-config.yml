@@ -1,0 +1,6 @@
+name: "CodeQL config"
+
+# ECOVACS API requires MD5 for signing/password wire format (see mower_api.md5); no other MD5.
+query-filters:
+  - exclude:
+      id: py/weak-sensitive-data-hashing
