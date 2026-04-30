@@ -58,7 +58,9 @@ MAP_HISTORY_STORE_DELAY_SECONDS = 5
 # - Prefer MQTT pushes for normal state and live movement. In particular, onPos
 #   should drive the live marker whenever ECOVACS publishes it.
 # - Poll while mowing only as a gap-filler after onPos has been quiet for a
-#   while; this avoids using frequent cloud reads as the animation source.
+#   while; this avoids using frequent cloud reads as the animation source. That
+#   poll also opens the trace gate and requests getMapTrace_V2 so the outline
+#   stays current when MQTT never delivers heading deltas.
 # - Poll while returning only until a terminal state is observed, because ECOVACS
 #   may stop position pushes near the dock and HA still needs to notice docking.
 # - Do not live-position poll for stable paused, stopped, idle, or docked states.
@@ -663,7 +665,11 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         )
 
     async def _async_refresh_position_while_mowing(self) -> None:
-        """Refresh live position only when mowing and MQTT position is stale."""
+        """Refresh live position only when mowing and MQTT position is stale.
+
+        Without MQTT onPos, heading-based trace gating never opens; still fetch the
+        mower trace on the same slow poll so completed mowing lines stay visible.
+        """
         while self.data and self.data.activity is MowerActivity.MOWING:
             await asyncio.sleep(MOWING_POSITION_REFRESH_SECONDS)
             if not self.data or self.data.activity is not MowerActivity.MOWING:
@@ -673,6 +679,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             try:
                 state = await self._async_refresh_live_position(self.data)
                 self.async_set_updated_data(self._compact_live_position_segment(state))
+                self._trace_update_due = True
+                self._schedule_trace_refresh()
             except EcovacsApiError as err:
                 _LOGGER.debug("ECOVACS mowing position refresh failed: %s", err)
                 self._capture_event(
