@@ -27,6 +27,9 @@ home-assistant.log*
 secrets.yaml
 known_devices.yaml
 
+# Machine-local artifacts (entire tree ignored).
+/ignored/
+
 # Capture / reverse engineering artifacts
 *.pcap
 *.pcapng
