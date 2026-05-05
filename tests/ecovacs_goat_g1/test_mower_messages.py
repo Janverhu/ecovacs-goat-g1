@@ -344,3 +344,9 @@ def test_ngiot_body_code_failure_raises_api_error() -> None:
             "clean_V2",
             {"body": {"code": 500, "msg": "Request Timeout"}},
         )
+
+
+def test_ngiot_null_json_body_is_not_an_error() -> None:
+    """Some models return JSON null on successful control (no structured payload)."""
+    _raise_for_control_error("clean_V2", None)
+    _raise_for_control_error("appping", None)

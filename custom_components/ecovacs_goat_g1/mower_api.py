@@ -248,7 +248,7 @@ class EcovacsMowerApi:
                 timeout=TIMEOUT,
             ) as response:
                 response.raise_for_status()
-                result: dict[str, Any] = await response.json(content_type=None)
+                result = await response.json(content_type=None)
                 try:
                     _raise_for_control_error(command, result)
                 except EcovacsApiError as err:
@@ -276,6 +276,10 @@ class EcovacsMowerApi:
                         "response": result,
                     },
                 )
+                # Some firmware (e.g. GOAT O800 RTK) returns HTTP 200 with a JSON null body
+                # for fire-and-forget controls; treat as an empty success envelope.
+                if result is None:
+                    return {}
                 return result
         except ClientError as err:
             self._capture_control_event(
@@ -467,7 +471,7 @@ def app_payload(data: Any) -> dict[str, Any]:
 
 def _raise_for_control_error(command: str, result: Any) -> None:
     """Raise when ECOVACS reports a failed N-GIoT control response."""
-    if result is None and command == "appping":
+    if result is None:
         return
     if not isinstance(result, dict):
         raise EcovacsApiError(f"Control command {command} returned {result!r}")
