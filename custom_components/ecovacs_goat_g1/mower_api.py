@@ -144,10 +144,11 @@ class EcovacsMowerApi:
 
         postfix = "" if self._country == COUNTRY_CHINA else f"-{self._continent}"
         country_lower = self._country.lower()
+        api_country = country_api_code(self._country)
         tld = "com" if self._country != COUNTRY_CHINA else country_lower
         self._portal_url = f"https://portal{postfix}.ecouser.net"
-        self._login_url = f"https://gl-{country_lower}-api.ecovacs.{tld}"
-        self._auth_code_url = f"https://gl-{country_lower}-openapi.ecovacs.{tld}"
+        self._login_url = f"https://gl-{api_country}-api.ecovacs.{tld}"
+        self._auth_code_url = f"https://gl-{api_country}-openapi.ecovacs.{tld}"
 
     @property
     def continent(self) -> str:
@@ -361,7 +362,7 @@ class EcovacsMowerApi:
     async def _login_password(self) -> dict[str, Any]:
         meta = {
             **META,
-            "country": self._country.lower(),
+            "country": country_api_code(self._country),
             "deviceId": self._device_id,
         }
         params: dict[str, str | int] = {
@@ -397,7 +398,7 @@ class EcovacsMowerApi:
             "resource": self._device_id,
             "org": "ECOWW" if self._country != COUNTRY_CHINA else "ECOCN",
             "last": "",
-            "country": self._country if self._country != COUNTRY_CHINA else "Chinese",
+            "country": country_api_code(self._country).upper() if self._country != COUNTRY_CHINA else "Chinese",
             "todo": "loginByItToken",
         }
         for _ in range(3):
@@ -520,6 +521,14 @@ def md5(value: str) -> str:
     """MD5 hex digest for ECOVACS API compatibility (vendor signing and password wire format)."""
     # codeql[py/weak-sensitive-data-hashing]
     return hashlib.md5(value.encode(), usedforsecurity=False).hexdigest()
+
+
+def country_api_code(country: str) -> str:
+    """Return the country code used by the API for the given country."""
+    code = country.lower()
+    if code == "gb":
+        code = "uk"
+    return code
 
 
 def country_continent(country: str) -> str:
