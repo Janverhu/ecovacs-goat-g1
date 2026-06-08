@@ -522,12 +522,14 @@ def md5(value: str) -> str:
     # codeql[py/weak-sensitive-data-hashing]
     return hashlib.md5(value.encode(), usedforsecurity=False).hexdigest()
 
+
 def country_api_code(country: str) -> str:
-    """Return the country code used by the api for the given country"""
-    country_api_code = country.lower()
-    if country_api_code == "gb":
-        country_api_code = "uk"
-    return country_api_code
+    """Return the country code used by the API for the given country."""
+    code = country.lower()
+    if code == "gb":
+        code = "uk"
+    return code
+
 
 def country_continent(country: str) -> str:
     """Return the ECOVACS data-center continent key."""
