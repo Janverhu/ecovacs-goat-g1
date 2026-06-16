@@ -536,8 +536,6 @@ def _map_uwb_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
 
 def _map_trace_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
     """Merge chunked onMapTrace_V2 data into the map cache."""
-    if _is_stale_map_payload(current, data):
-        return current
     batch_id = str(data.get("batid")) if data.get("batid") is not None else None
     serial = str(data.get("serial")) if data.get("serial") is not None else None
     trace_type = str(data.get("type")) if data.get("type") is not None else None
@@ -562,7 +560,12 @@ def _map_trace_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
 
     return replace(
         current,
-        mid=str(data.get("mid")) if data.get("mid") is not None else current.mid,
+        # The active map id is owned solely by the live position stream
+        # (:data:`_ACTIVE_MAP_ID_COMMANDS`). Trace replies only contribute
+        # geometry for whichever map is already active; letting them change the
+        # mid would make the next position push look like a remap and reset the
+        # geometry we just decoded.
+        mid=current.mid,
         trace=replace(
             trace,
             batch_id=batch_id or trace.batch_id,
@@ -579,8 +582,6 @@ def _map_trace_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
 
 def _map_info_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
     """Merge chunked onMapInfo_V2 data into the base map cache."""
-    if _is_stale_map_payload(current, data):
-        return current
     batch_id = str(data.get("batid")) if data.get("batid") is not None else None
     serial = str(data.get("serial")) if data.get("serial") is not None else None
     map_type = str(data.get("type")) if data.get("type") is not None else None
@@ -606,7 +607,9 @@ def _map_info_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
 
     return replace(
         current,
-        mid=str(data.get("mid")) if data.get("mid") is not None else current.mid,
+        # See ``_map_trace_data``: base-map replies feed geometry but must never
+        # re-own the active map id, which belongs to the live position stream.
+        mid=current.mid,
         info=replace(
             map_info,
             batch_id=batch_id or map_info.batch_id,
@@ -634,9 +637,11 @@ def _reset_map_on_id_change(state: MowerState, data: Any) -> MowerState:
     is left untouched because it self-corrects from the next position push.
 
     This only runs for the authoritative live position/beacon stream
-    (:data:`_ACTIVE_MAP_ID_COMMANDS`); base-map and trace replies never switch
-    the active map, so a stale-map reply cannot thrash the geometry back and
-    forth with the live stream.
+    (:data:`_ACTIVE_MAP_ID_COMMANDS`); base-map and trace replies never write
+    the active map id (see ``_map_trace_data`` / ``_map_info_data``), so a
+    geometry reply whose ``mid`` lives in a different namespace than the
+    position stream cannot thrash the active map back and forth with the live
+    stream or get spuriously discarded.
     """
     if not isinstance(data, dict):
         return state
@@ -660,22 +665,6 @@ def _reset_map_on_id_change(state: MowerState, data: Any) -> MowerState:
             revision=state.map.revision + 1,
         ),
     )
-
-
-def _is_stale_map_payload(current: MowerMap, data: dict[str, Any]) -> bool:
-    """Return whether a base-map / trace payload is for a non-active map.
-
-    The active map id is owned by the live position stream. A geometry reply
-    that explicitly names a different ``mid`` belongs to another (e.g. old,
-    pre-remap) map; applying it would overwrite the active map's outline and
-    cause the base map to flicker between maps, so it is ignored. Payloads with
-    no ``mid`` (chunked continuations) or that arrive before any map id is known
-    are accepted.
-    """
-    incoming = data.get("mid")
-    if incoming is None or not current.mid:
-        return False
-    return str(incoming) != current.mid
 
 
 def _rtk_station(data: dict[str, Any]) -> MapPosition | None:

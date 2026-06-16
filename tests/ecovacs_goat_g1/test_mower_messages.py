@@ -481,37 +481,47 @@ def test_same_map_id_keeps_existing_geometry() -> None:
     assert state.map.trace.path != ()
 
 
-def test_stale_base_map_reply_is_ignored() -> None:
-    """A base map reply for a different map id must not overwrite the active map."""
+def test_base_map_reply_does_not_re_own_active_map_id() -> None:
+    """Base-map replies feed geometry but never re-own the active map id.
+
+    The G1 position stream and the ``getMapInfo_V2`` geometry reply can report
+    ``mid`` values from different namespaces, so a base-map reply must be
+    applied for the active map (not discarded) while leaving the active map id
+    owned by the live position stream. Discarding it was the regression that
+    made the mowed-area outline disappear.
+    """
     state = _state_with_decoded_map("100")
-    original_info = state.map.info
 
     state = apply_command_data(
         state,
         "onMapInfo_V2",
-        {"mid": "200", "batid": "other", "serial": "0", "type": "0", "index": 0,
+        {"mid": "200", "batid": "fresh", "serial": "0", "type": "0", "index": 0,
          "info": "ignored"},
     )
 
     assert state.map.mid == "100"
-    assert state.map.info is original_info
-    assert state.map.info.outline != ()
+    assert state.map.info.batch_id == "fresh"
 
 
-def test_stale_trace_reply_is_ignored() -> None:
-    """A trace reply for a different map id must not overwrite the active trace."""
+def test_trace_reply_does_not_re_own_active_map_id() -> None:
+    """Trace replies advance the trace but never re-own the active map id.
+
+    Letting a trace reply rewrite the active map id made the next position push
+    look like a remap, which reset the trace and left the live segment growing
+    into a continuous trace. The trace reply is applied while the position
+    stream keeps ownership of the active map id.
+    """
     state = _state_with_decoded_map("100")
-    original_trace = state.map.trace
 
     state = apply_command_data(
         state,
         "onMapTrace_V2",
-        {"mid": "200", "batid": "other", "serial": "0", "type": "0", "index": 0,
+        {"mid": "200", "batid": "fresh", "serial": "0", "type": "0", "index": 0,
          "info": "ignored"},
     )
 
     assert state.map.mid == "100"
-    assert state.map.trace is original_trace
+    assert state.map.trace.batch_id == "fresh"
 
 
 def test_trace_reply_for_active_map_is_applied() -> None:
@@ -551,16 +561,20 @@ def test_o_series_rtk_station_position_parsed() -> None:
         {
             "result": 0,
             "rtks": [
-                {"x": 578, "y": 1997, "sn": "032888", "state": 0, "mode": 0}
+                {"x": 1234, "y": 5678, "sn": "RTKSN0001", "state": 0, "mode": 0}
             ],
             "observations": {"solStat": 0, "roverSvs": 33},
         },
     )
 
     assert state.map.rtk_station is not None
-    assert state.map.rtk_station.x == 578
-    assert state.map.rtk_station.y == 1997
-    assert state.map.as_dict()["rtk_station"] == {"x": 578, "y": 1997, "sn": "032888"}
+    assert state.map.rtk_station.x == 1234
+    assert state.map.rtk_station.y == 5678
+    assert state.map.as_dict()["rtk_station"] == {
+        "x": 1234,
+        "y": 5678,
+        "sn": "RTKSN0001",
+    }
 
 
 def test_o_series_rtk_empty_list_keeps_no_station() -> None:
