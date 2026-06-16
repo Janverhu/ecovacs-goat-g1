@@ -62,6 +62,17 @@ Until this is available as a default HACS repository, add it manually:
 6. Restart Home Assistant.
 7. Add the integration from **Settings -> Devices & services -> Add integration**.
 
+### Testing pre-release (beta) builds
+
+Experimental builds — for example new model support being validated with a tester — are **automatically published as pre-releases** from the development branch (each push produces an incrementing beta such as `0.2.0b1`, `0.2.0b2`). To install one in HACS:
+
+1. Open **Ecovacs GOAT G1** in HACS.
+2. Three-dot menu -> **Redownload**.
+3. Enable **Show beta versions**.
+4. Pick the beta (e.g. `0.2.0b1`) and download, then **restart Home Assistant**.
+
+To return to a stable build later, redownload and pick the latest non-beta version.
+
 ## Setup
 
 You need your ECOVACS account username, password, and country. The integration uses the ECOVACS cloud, just like the official app.
