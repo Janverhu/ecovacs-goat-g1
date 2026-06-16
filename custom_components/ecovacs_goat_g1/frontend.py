@@ -51,7 +51,9 @@ async def async_register_frontend_card(hass: HomeAssistant) -> None:
     version = await _async_card_version(hass)
     add_extra_js_url(hass, f"{CARD_URL_PATH}?v={version}")
     hass.data[_REGISTERED_KEY] = True
-    _LOGGER.debug("Registered ECOVACS GOAT card at %s?v=%s", CARD_URL_PATH, version)
+    _LOGGER.info(
+        "Registered ECOVACS GOAT dashboard card at %s?v=%s", CARD_URL_PATH, version
+    )
 
 
 async def _async_card_version(hass: HomeAssistant) -> str:

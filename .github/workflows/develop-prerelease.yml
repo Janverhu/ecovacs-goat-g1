@@ -20,6 +20,9 @@ jobs:
   prerelease:
     name: Publish develop pre-release
     runs-on: ubuntu-latest
+    env:
+      # Run JavaScript actions on Node.js 24 (Node 20 is being deprecated).
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - uses: actions/checkout@v5
         with:
