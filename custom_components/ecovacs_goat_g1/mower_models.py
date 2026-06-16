@@ -229,6 +229,7 @@ class MowerMap:
     current_position: MapPosition | None = None
     charge_positions: tuple[MapPosition, ...] = ()
     uwb_positions: tuple[MapPosition, ...] = ()
+    rtk_station: MapPosition | None = None
     position_history: tuple[MapPosition, ...] = ()
     info: MowerMapInfo = field(default_factory=MowerMapInfo)
     trace: MowerMapTrace = field(default_factory=MowerMapTrace)
@@ -244,6 +245,7 @@ class MowerMap:
             else None,
             "charge_positions": [position.as_dict() for position in self.charge_positions],
             "uwb_positions": [position.as_dict() for position in self.uwb_positions],
+            "rtk_station": self.rtk_station.as_dict() if self.rtk_station else None,
             "position_history": [
                 position.as_dict()
                 for position in _sample_positions(
@@ -304,4 +306,5 @@ class MowerState:
     lifespans: dict[str, float] = field(default_factory=dict)
     robot_features: dict[str, Any] | None = None
     goat_g1_variant: str = "unknown"
+    mower_family: str = "unknown"
     raw: dict[str, Any] = field(default_factory=dict)

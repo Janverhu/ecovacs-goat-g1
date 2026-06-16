@@ -257,6 +257,11 @@ const STYLE = `
     stroke: #fff;
     stroke-width: 3;
   }
+  .map-rtk-station {
+    fill: #f5a623;
+    stroke: #fff;
+    stroke-width: 2;
+  }
   .map-mower {
     fill: #2196f3;
     stroke: #fff;
@@ -934,6 +939,7 @@ class EcovacsGoatCard extends HTMLElement {
       charge,
     });
     const beacons = this._positions(map.uwb_positions);
+    const rtkStation = this._position(map.rtk_station);
 
     return `
       <div class="map">
@@ -945,13 +951,14 @@ class EcovacsGoatCard extends HTMLElement {
           current,
           charge,
           beacons,
+          rtkStation,
           mowerState,
         })}
       </div>
     `;
   }
 
-  _mapSvg({ garden, obstacles, mowedArea, livePath, current, charge, beacons, mowerState }) {
+  _mapSvg({ garden, obstacles, mowedArea, livePath, current, charge, beacons, rtkStation, mowerState }) {
     const points = [
       ...garden,
       ...obstacles.flat(),
@@ -960,6 +967,7 @@ class EcovacsGoatCard extends HTMLElement {
       ...(current ? [current] : []),
       ...charge,
       ...beacons,
+      ...(rtkStation ? [rtkStation] : []),
     ];
     if (!points.length) {
       return `<div class="map-empty">Waiting for live map data</div>`;
@@ -1009,6 +1017,16 @@ class EcovacsGoatCard extends HTMLElement {
             `;
           })
           .join("")}
+        ${rtkStation
+          ? (() => {
+              const point = this._project(rtkStation, bounds, width, height);
+              return `
+              <path class="map-rtk-station" d="M ${point.x} ${point.y - 8} L ${
+                point.x + 7
+              } ${point.y + 5} L ${point.x - 7} ${point.y + 5} Z"></path>
+            `;
+            })()
+          : ""}
         ${currentPoint
           ? `
             <g transform="translate(${currentPoint.x} ${currentPoint.y})">
@@ -1467,11 +1485,16 @@ class EcovacsGoatCard extends HTMLElement {
   }
 }
 
-customElements.define("ecovacs-goat-card", EcovacsGoatCard);
+// Guard against double-registration: the integration now auto-loads this card,
+// so an existing manual Lovelace resource pointing at the old path would
+// otherwise try to define the element a second time and throw.
+if (!customElements.get("ecovacs-goat-card")) {
+  customElements.define("ecovacs-goat-card", EcovacsGoatCard);
 
-window.customCards = window.customCards || [];
-window.customCards.push({
-  type: "ecovacs-goat-card",
-  name: "Ecovacs GOAT Card",
-  description: "Control an ECOVACS GOAT mower with explicit start, stop, dock, and live-map keepalive buttons.",
-});
+  window.customCards = window.customCards || [];
+  window.customCards.push({
+    type: "ecovacs-goat-card",
+    name: "Ecovacs GOAT Card",
+    description: "Control an ECOVACS GOAT mower with explicit start, stop, dock, and live-map keepalive buttons.",
+  });
+}

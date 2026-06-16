@@ -36,6 +36,12 @@ known_devices.yaml
 *.mitm
 *.har
 *.log
+*.apk
+
+# Local symlink to private app captures / decompiled APK (never commit; contains
+# account tokens, device ids, and copyrighted vendor code).
+/captures
+/captures/**
 
 # pre-commit (Trivy Docker hook cache)
 .pre-commit-trivy-cache/

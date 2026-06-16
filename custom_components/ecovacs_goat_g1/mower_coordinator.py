@@ -18,6 +18,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .debug_capture import DebugCaptureStore
 from .goat_g1_models import classify_goat_g1_variant
+from .mower_profiles import MapDialect, profile_for_model
 from .mower_compat import (
     ProtocolProfile,
     apply_resilient_getinfo_group,
@@ -183,11 +184,12 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         self.api = api
         self.device = device
         self._debug_capture = debug_capture
-        self.data = replace(
-            MowerState(),
-            goat_g1_variant=classify_goat_g1_variant(device.model),
+        self._capability = profile_for_model(device.model)
+        self.data = self._base_state()
+        self._protocol = ProtocolProfile(
+            map_api_uses_v2=self._capability.map_uses_v2,
+            get_pos_fields=self._capability.position_fields,
         )
-        self._protocol = ProtocolProfile()
         self._last_mqtt_at: float | None = None
         self._last_position_mqtt_at: float | None = None
         self._last_position_heading: float | None = None
@@ -1073,10 +1075,25 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         """Force a grouped state refresh from the mower."""
         self.async_set_updated_data(await self._async_refresh_state_groups())
 
+    def _startup_getinfo_groups(self) -> tuple[tuple[str, ...], ...]:
+        """Return startup getInfo groups adapted to this model's dialect.
+
+        O-series mowers read mowing status via ``getCleanInfo`` rather than
+        ``getCleanInfo_V2``; substitute it up-front so we do not waste retries
+        rediscovering that on every device.
+        """
+        clean_info = self._capability.clean_info_command
+        if clean_info == "getCleanInfo_V2":
+            return STARTUP_GET_INFO_GROUPS
+        return tuple(
+            tuple(clean_info if cmd == "getCleanInfo_V2" else cmd for cmd in group)
+            for group in STARTUP_GET_INFO_GROUPS
+        )
+
     async def _async_refresh_state_groups(self) -> MowerState:
         """Refresh only the app-captured grouped state/settings payloads."""
         state = self.data or self._base_state()
-        for group in STARTUP_GET_INFO_GROUPS:
+        for group in self._startup_getinfo_groups():
             state, self._protocol = await apply_resilient_getinfo_group(
                 self.api,
                 self.device,
@@ -1096,12 +1113,16 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             _LOGGER.debug("ECOVACS live position refresh failed: %s", err)
             return state
 
+        if self._capability.map_dialect is MapDialect.MAP_RTK:
+            return await self._async_refresh_rtk_map(state)
+
         if not self._protocol.map_api_uses_v2:
             return state
         try:
             if state.map.mid:
                 if not state.map.info.outline:
                     map_info_payload: dict[str, Any] = {
+                        "mid": state.map.mid,
                         "using": 0,
                         "serial": 0,
                         "index": 0,
@@ -1131,6 +1152,35 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 self._protocol = replace(self._protocol, map_api_uses_v2=False)
             else:
                 _LOGGER.debug("ECOVACS live map refresh failed: %s", err)
+        return state
+
+    async def _async_refresh_rtk_map(self, state: MowerState) -> MowerState:
+        """Best-effort O-series (RTK) map refresh.
+
+        The shared position stream refreshed above already provides the live
+        marker (and the map id via ``getPos``). O-series mowers use the
+        ``getMapState`` / ``getMapTrack`` dialect rather than the G1 ``*_V2``
+        calls, so we read ``getMapState`` for build status and otherwise rely on
+        position. The ``getMapTrack`` / ``getMI`` area-outline blobs are not
+        decoded: the only available O-series capture was taken while docked
+        (``getMapTrack`` returns ``fail``), so there is no validated geometry to
+        decode. This keeps O-series mowers from spamming ``*_V2`` map errors
+        while still driving a useful live position map.
+        """
+        try:
+            response = await self.api.control(self.device, "getMapState", {})
+            state = apply_response(state, "getMapState", response)
+        except EcovacsApiError as err:
+            _LOGGER.debug("ECOVACS O-series getMapState failed: %s", err)
+            self._capture_event(
+                "rtk_map_state_error", {"exception": repr(err)}
+            )
+        try:
+            response = await self.api.control(self.device, "getRTK", {})
+            state = apply_response(state, "getRTK", response)
+        except EcovacsApiError as err:
+            _LOGGER.debug("ECOVACS O-series getRTK failed: %s", err)
+            self._capture_event("rtk_station_error", {"exception": repr(err)})
         return state
 
     async def _async_refresh_live_position(self, state: MowerState) -> MowerState:
@@ -1188,6 +1238,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         return replace(
             MowerState(),
             goat_g1_variant=classify_goat_g1_variant(self.device.model),
+            mower_family=str(self._capability.family),
         )
 
     @property
@@ -1198,6 +1249,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             "goat_g1_variant": self.data.goat_g1_variant
             if self.data
             else classify_goat_g1_variant(self.device.model),
+            "capability_profile": self._capability.as_dict(),
             "device_name": self.device.model,
         }
 
@@ -1219,11 +1271,16 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         """Start or resume mowing using app-captured clean_V2 bodies."""
         await self.async_refresh_if_stale()
         previous_activity = self.data.activity
-        if previous_activity in {MowerActivity.PAUSED, MowerActivity.RETURNING}:
-            payload = {"act": "resume"}
-        else:
-            payload = {"act": "start", "content": {"type": "auto"}}
-        await self.control("clean_V2", payload, refresh_if_stale=False)
+        act = (
+            "resume"
+            if previous_activity in {MowerActivity.PAUSED, MowerActivity.RETURNING}
+            else "start"
+        )
+        await self.control(
+            self._capability.clean_command,
+            self._capability.clean_body(act),
+            refresh_if_stale=False,
+        )
         mower_map = self.data.map
         if previous_activity not in {
             MowerActivity.MOWING,
@@ -1246,7 +1303,11 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
     async def pause(self) -> None:
         """Pause active mowing."""
         await self.async_refresh_if_stale()
-        await self.control("clean_V2", {"act": "pause"}, refresh_if_stale=False)
+        await self.control(
+            self._capability.clean_command,
+            self._capability.clean_body("pause"),
+            refresh_if_stale=False,
+        )
         self.async_set_updated_data(replace(self.data, activity=MowerActivity.PAUSED))
         self._schedule_outcome_poll(
             "pause", lambda state: state.activity is MowerActivity.PAUSED
@@ -1256,8 +1317,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         """End the active mowing session."""
         await self.async_refresh_if_stale()
         await self.control(
-            "clean_V2",
-            {"act": "stop", "content": {"type": ""}},
+            self._capability.clean_command,
+            self._capability.clean_body("stop"),
             refresh_if_stale=False,
         )
         self.async_set_updated_data(replace(self.data, activity=MowerActivity.IDLE))

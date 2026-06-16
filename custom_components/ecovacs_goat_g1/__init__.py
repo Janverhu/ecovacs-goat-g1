@@ -24,6 +24,7 @@ from .const import (
     SERVICE_STOP_DEBUG_CAPTURE,
 )
 from .controller import EcovacsController
+from .frontend import async_register_frontend_card
 
 PLATFORMS = [
     Platform.BUTTON,
@@ -82,6 +83,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcovacsConfigEntry) -> b
     entry.runtime_data = controller
 
     _async_register_services(hass)
+    await async_register_frontend_card(hass)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 

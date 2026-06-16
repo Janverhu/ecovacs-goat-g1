@@ -27,6 +27,7 @@ from . import EcovacsConfigEntry
 from .entity import EcovacsMowerEntity
 from .goat_g1_models import variant_label
 from .mower_models import MowerState
+from .mower_profiles import profile_for_family
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -147,10 +148,13 @@ SENSORS: tuple[MowerSensorDescription, ...] = (
     ),
     MowerSensorDescription(
         key="goat_g1_model_line",
-        name="GOAT G1 model line",
+        name="GOAT model line",
         value_fn=lambda state: variant_label(state.goat_g1_variant),
         attr_fn=lambda state: {
             "variant_id": state.goat_g1_variant,
+            "family": state.mower_family,
+            "map_dialect": str(profile_for_family(state.mower_family).map_dialect),
+            "experimental": profile_for_family(state.mower_family).experimental,
             "robot_features": state.robot_features or {},
         },
         entity_category=EntityCategory.DIAGNOSTIC,

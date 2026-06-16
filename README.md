@@ -18,6 +18,23 @@ Developed and tested with an **ECOVACS GOAT G1-800**.
 
 No promise is made that it will work with any other mower model. ECOVACS vacuums are not supported.
 
+### Other models (experimental)
+
+The integration now detects the **mower family** and adapts the protocol dialect it uses:
+
+- **GOAT G1 line** (G1, G1-800 / G-800, G1-2000, G1-1600) — fully implemented and validated. Uses the UWB beacon + `*_V2` map dialect.
+- **GOAT O-series** (O800 RTK, O1200, O1200 LiDAR Pro, ...) — **experimental, best-effort**. These models speak a different dialect: the `clean` command (not `clean_V2`), `getCleanInfo` (not `getCleanInfo_V2`), RTK reference points (`rtkPos`) instead of UWB, and the `getMapState` / `getMapTrack` / `getMI` / `getAreaSet` map commands. This was confirmed against a decrypted capture of a **GOAT O800 RTK** (firmware 1.9.10).
+
+For O-series mowers the integration:
+
+- Detects the model and reports it on the **GOAT model line** diagnostic sensor (with `family`, `map_dialect`, and an `experimental` flag).
+- Drives the lawn mower entity, start/pause/resume/stop/dock controls, status, battery, error, and the **live position map** (mower marker + path) from the shared position stream.
+- Shows the **RTK base station** on the map (from `getRTK`) where the G1 line shows UWB beacons.
+- **Does not** yet draw the completed-area outline, because the only available O-series capture was taken while docked (the map-trace command returns `fail` with no job running), so there is no validated geometry sample to decode. The map id is still learned so this can be finished later.
+- Avoids spamming `*_V2` map errors that the previous G1-only code produced on these mowers.
+
+If you own an O-series mower and want fuller support (especially the area outline), the most useful thing you can provide is a sanitized capture from the official app **taken during active mowing**. See **Debug Capture** below and the issue tracker.
+
 ## Why This Integration Exists
 
 This project is separate from Home Assistant's regular ECOVACS integration. It was created because the regular Ecovacs/Home Assistant path is built around a broader vacuum-oriented command stack, while this project only targets GOAT mowers and uses behavior observed from the official ECOVACS app.
@@ -55,17 +72,13 @@ During setup, choose a Home Assistant device name. A generated default such as `
 
 The custom card is optional, but recommended. It exposes a clear stop button and a mower-focused map layout.
 
-To install it:
+**No manual install is needed.** The integration bundles the card and registers it with Home Assistant automatically: it serves `ecovacs-goat-card.js` from the integration and loads it as a frontend module, versioned to the integration release so browsers pick up updates after each upgrade (a hard refresh may be needed once).
 
-1. Copy `www/ecovacs-goat-card.js` from this repository to your Home Assistant config directory as `www/ecovacs_goat/ecovacs-goat-card.js`.
-2. In Home Assistant, open **Settings -> Dashboards -> Resources**.
-3. Add a JavaScript module resource:
+Just add **Ecovacs GOAT Card** from the custom card picker (you may need to reload the dashboard once after first install).
 
-```text
-/local/ecovacs_goat/ecovacs-goat-card.js
-```
+> **Upgrading from a manual install (do this):** if you previously added a `/local/ecovacs_goat/ecovacs-goat-card.js` Lovelace resource, **remove it** in **Settings -> Dashboards -> Resources**, then hard-refresh your browser (Ctrl+Shift+R / Cmd+Shift+R). This is required: a dashboard card can only be registered once, and the old manual resource has no version in its URL, so your browser keeps loading the **cached old card** and never picks up the bundled one. You can also delete the copied `config/www/ecovacs_goat/ecovacs-goat-card.js` file.
 
-After the resource is loaded, add **Ecovacs GOAT Card** from the custom card picker. The card’s **keepalive** control starts a timed **`request_live_position_stream`** session so the mower behaves as if the official app map is open (MQTT-heavy updates). How that fits with the trace outline and the 60 second fallback is explained under **How It Behaves** below.
+The card’s **keepalive** control starts a timed **`request_live_position_stream`** session so the mower behaves as if the official app map is open (MQTT-heavy updates). How that fits with the trace outline and the 60 second fallback is explained under **How It Behaves** below.
 
 Example YAML:
 

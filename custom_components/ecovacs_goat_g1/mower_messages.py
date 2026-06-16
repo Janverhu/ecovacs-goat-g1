@@ -46,6 +46,11 @@ POSITION_HISTORY_ACTIVITIES = {
     MowerActivity.MOWING,
     MowerActivity.RETURNING,
 }
+# The live position/beacon stream reports the map the mower is physically in, so
+# it is the single source of truth for the active map id. Only these commands
+# may switch the active map (and reset stale geometry); base-map / trace replies
+# merely contribute geometry for whichever map is already active.
+_ACTIVE_MAP_ID_COMMANDS = {"getPos", "onPos", "getUWB", "onUWB"}
 
 
 def decode_payload(payload: str | bytes | bytearray | dict[str, Any]) -> dict[str, Any]:
@@ -116,6 +121,9 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
             nested_data = nested.get("data", nested) if isinstance(nested, dict) else nested
             state = apply_command_data(state, nested_command, nested_data)
         return state
+
+    if command in _ACTIVE_MAP_ID_COMMANDS:
+        state = _reset_map_on_id_change(state, data)
 
     match command:
         case "getBattery" | "onBattery":
@@ -238,6 +246,35 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
         case "getMapInfo_V2" | "onMapInfo_V2":
             if isinstance(data, dict):
                 state = replace(state, map=_map_info_data(state.map, data))
+        case (
+            "getMapState"
+            | "onMapState"
+            | "getMapTrack"
+            | "onMapTrack"
+            | "getMI"
+            | "onMI"
+            | "getAreaSet"
+            | "onAreaSet"
+            | "getSpecialContour"
+            | "onSpecialContour"
+            | "getMapInfo"
+            | "onMapInfo"
+        ):
+            # O-series (RTK) map dialect. The area-outline / trace blobs use an
+            # encoding we do not decode without a validated active-mowing
+            # capture, so we only learn the map id here; the live marker comes
+            # from getPos/onPos (deebotPos + rtkPos).
+            if isinstance(data, dict):
+                state = replace(state, map=_map_mid_only(state.map, data))
+        case "getRTK" | "onRTK":
+            # O-series RTK reference: the fixed base station position. There is
+            # one station; show it where the G1 shows UWB beacons.
+            if isinstance(data, dict):
+                station = _rtk_station(data)
+                if station is not None:
+                    state = replace(
+                        state, map=replace(state.map, rtk_station=station)
+                    )
         case "getWifiList" | "onWifiList":
             if isinstance(data, dict):
                 first = next(iter(data.get("list", []) or []), {})
@@ -381,13 +418,22 @@ def _clean_activity(data: dict[str, Any], current: MowerActivity) -> MowerActivi
     state = data.get("state")
     clean_state = data.get("cleanState") or {}
     motion_state = clean_state.get("motionState")
-    if data.get("trigger") == "alert":
+    trigger = data.get("trigger")
+    if trigger == "alert":
         return MowerActivity.ERROR
     if motion_state == "pause" or data.get("paused") == 1:
         return MowerActivity.PAUSED
     if state == "goCharging" or motion_state == "goCharging":
         return MowerActivity.RETURNING
-    if state in ("clean", "washing") or motion_state == "working":
+    if state in ("clean", "working", "washing") or motion_state == "working":
+        return MowerActivity.MOWING
+    # A scheduled job that fires on the mower (not started from HA) reports a
+    # schedule trigger; treat an active scheduled job as mowing even when the
+    # exact state token differs by model (see issue #7, O1200 scheduled tasks).
+    if trigger in ("schedule", "appointment", "scheduleClean") and state not in (
+        "idle",
+        "goCharging",
+    ):
         return MowerActivity.MOWING
     if state == "idle":
         if current is MowerActivity.DOCKED:
@@ -397,11 +443,20 @@ def _clean_activity(data: dict[str, Any], current: MowerActivity) -> MowerActivi
 
 
 def _task_id(data: dict[str, Any], current: str | None) -> str | None:
-    """Return the best current mowing task id found in app payloads."""
-    for key in ("bdTaskID", "mowid", "cid", "cleanId"):
-        value = data.get(key)
-        if value not in (None, ""):
-            return str(value)
+    """Return the best current mowing task id found in app payloads.
+
+    O-series ``getCleanInfo`` nests the task id under ``cleanState.cid`` while G1
+    stats readbacks expose it at the top level, so check both.
+    """
+    sources: list[dict[str, Any]] = [data]
+    clean_state = data.get("cleanState")
+    if isinstance(clean_state, dict):
+        sources.append(clean_state)
+    for source in sources:
+        for key in ("bdTaskID", "mowid", "cid", "cleanId"):
+            value = source.get(key)
+            if value not in (None, ""):
+                return str(value)
     return current
 
 
@@ -438,7 +493,10 @@ def _map_position_data(
     """Merge mower, station, and beacon positions into the map cache."""
     mower_position = _map_position(data.get("deebotPos"))
     charge_positions = _map_positions(data.get("chargePos"))
-    uwb_positions = _map_positions(data.get("uwbPos"))
+    # G1 reports UWB beacon positions; O-series (RTK) reports rtkPos instead.
+    uwb_positions = _map_positions(data.get("uwbPos")) or _map_positions(
+        data.get("rtkPos")
+    )
     history = current.position_history
 
     if record_history and mower_position and mower_position.invalid != 1:
@@ -460,7 +518,9 @@ def _map_position_data(
 
 def _map_uwb_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
     """Merge beacon position data from getUWB/onUWB payloads."""
-    uwb_positions = _map_positions(data.get("uwbPos"))
+    uwb_positions = _map_positions(data.get("uwbPos")) or _map_positions(
+        data.get("rtkPos")
+    )
     if uwb_positions and not any(
         position.x != 0 or position.y != 0 for position in uwb_positions
     ):
@@ -476,6 +536,8 @@ def _map_uwb_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
 
 def _map_trace_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
     """Merge chunked onMapTrace_V2 data into the map cache."""
+    if _is_stale_map_payload(current, data):
+        return current
     batch_id = str(data.get("batid")) if data.get("batid") is not None else None
     serial = str(data.get("serial")) if data.get("serial") is not None else None
     trace_type = str(data.get("type")) if data.get("type") is not None else None
@@ -517,6 +579,8 @@ def _map_trace_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
 
 def _map_info_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
     """Merge chunked onMapInfo_V2 data into the base map cache."""
+    if _is_stale_map_payload(current, data):
+        return current
     batch_id = str(data.get("batid")) if data.get("batid") is not None else None
     serial = str(data.get("serial")) if data.get("serial") is not None else None
     map_type = str(data.get("type")) if data.get("type") is not None else None
@@ -555,6 +619,92 @@ def _map_info_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
         ),
         last_update_ts=_int(data.get("_mqtt_ts")) or current.last_update_ts,
     )
+
+
+def _reset_map_on_id_change(state: MowerState, data: Any) -> MowerState:
+    """Drop stale map geometry when the active map id changes (remap).
+
+    Resetting the mower and remapping produces a fresh ``mid``. The previously
+    decoded base map outline, obstacles, live trace, mowed-area history, and
+    charger/beacon positions all belong to the old map's coordinate frame, so
+    keeping them would leave the integration showing the old base map while the
+    mowed area drifts off it. Clearing the cached outline also lets the
+    coordinator re-fetch ``getMapInfo_V2`` for the new map (it only requests the
+    base map while no outline is cached). The live marker (``current_position``)
+    is left untouched because it self-corrects from the next position push.
+
+    This only runs for the authoritative live position/beacon stream
+    (:data:`_ACTIVE_MAP_ID_COMMANDS`); base-map and trace replies never switch
+    the active map, so a stale-map reply cannot thrash the geometry back and
+    forth with the live stream.
+    """
+    if not isinstance(data, dict):
+        return state
+    incoming = data.get("mid")
+    if incoming is None:
+        return state
+    incoming = str(incoming)
+    current_mid = state.map.mid
+    if not current_mid or incoming == current_mid:
+        return state
+    return replace(
+        state,
+        map=replace(
+            state.map,
+            mid=incoming,
+            info=MowerMapInfo(),
+            trace=MowerMapTrace(),
+            position_history=(),
+            charge_positions=(),
+            uwb_positions=(),
+            revision=state.map.revision + 1,
+        ),
+    )
+
+
+def _is_stale_map_payload(current: MowerMap, data: dict[str, Any]) -> bool:
+    """Return whether a base-map / trace payload is for a non-active map.
+
+    The active map id is owned by the live position stream. A geometry reply
+    that explicitly names a different ``mid`` belongs to another (e.g. old,
+    pre-remap) map; applying it would overwrite the active map's outline and
+    cause the base map to flicker between maps, so it is ignored. Payloads with
+    no ``mid`` (chunked continuations) or that arrive before any map id is known
+    are accepted.
+    """
+    incoming = data.get("mid")
+    if incoming is None or not current.mid:
+        return False
+    return str(incoming) != current.mid
+
+
+def _rtk_station(data: dict[str, Any]) -> MapPosition | None:
+    """Return the RTK base station position from a getRTK/onRTK payload.
+
+    The payload exposes ``rtks`` as a list, but an O-series setup has a single
+    fixed base station, so the first valid entry is used.
+    """
+    stations = data.get("rtks")
+    if not isinstance(stations, list):
+        return None
+    for item in stations:
+        position = _map_position(item)
+        if position is not None and position.invalid != 1:
+            return position
+    return None
+
+
+def _map_mid_only(current: MowerMap, data: dict[str, Any]) -> MowerMap:
+    """Record only the map id from an O-series map payload.
+
+    The major/minor map and move-trace blobs are not decoded (their binary
+    encoding is unverified), so we keep the existing geometry and just learn the
+    current ``mid`` when present.
+    """
+    mid = data.get("mid")
+    if mid is None or str(mid) == (current.mid or ""):
+        return current
+    return replace(current, mid=str(mid))
 
 
 def _map_position(data: Any) -> MapPosition | None:

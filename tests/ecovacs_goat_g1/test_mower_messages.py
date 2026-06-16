@@ -21,7 +21,14 @@ from custom_components.ecovacs_goat_g1.mower_messages import (
     apply_mqtt_payload,
     apply_response,
 )
-from custom_components.ecovacs_goat_g1.mower_models import MowerActivity, MowerState
+from custom_components.ecovacs_goat_g1.mower_models import (
+    MapPosition,
+    MowerActivity,
+    MowerMap,
+    MowerMapInfo,
+    MowerMapTrace,
+    MowerState,
+)
 from custom_components.ecovacs_goat_g1.mower_api import (
     EcovacsApiError,
     _raise_for_control_error,
@@ -350,3 +357,226 @@ def test_ngiot_null_json_body_is_not_an_error() -> None:
     """Some models return JSON null on successful control (no structured payload)."""
     _raise_for_control_error("clean_V2", None)
     _raise_for_control_error("appping", None)
+
+
+def test_scheduled_clean_info_reports_mowing() -> None:
+    """A scheduled job that fires on the mower should report as mowing (issue #7)."""
+    state = apply_mqtt_payload(
+        MowerState(activity=MowerActivity.IDLE),
+        "iot/atr/onCleanInfo_V2/endpoint/77atlz/ONb7/j",
+        b'{"body":{"data":{"trigger":"schedule","state":"working"}}}',
+    )
+
+    assert state.activity is MowerActivity.MOWING
+
+
+def test_scheduled_trigger_does_not_override_returning() -> None:
+    """A scheduled trigger reporting goCharging must not be forced to mowing."""
+    state = apply_command_data(
+        MowerState(),
+        "getCleanInfo_V2",
+        {"trigger": "schedule", "state": "goCharging"},
+    )
+
+    assert state.activity is MowerActivity.RETURNING
+
+
+def test_o_series_clean_info_uses_shared_parser() -> None:
+    """The O800 RTK getCleanInfo payload has the same fields as G1 getCleanInfo_V2."""
+    state = apply_command_data(
+        MowerState(),
+        "getCleanInfo",
+        {
+            "trigger": "app",
+            "other": "0",
+            "state": "clean",
+            "cleanState": {
+                "motionState": "working",
+                "cid": "122",
+                "content": {"type": "auto", "subContent": {"type": "auto"}},
+            },
+        },
+    )
+
+    assert state.activity is MowerActivity.MOWING
+    assert state.task_id == "122"
+
+
+def test_o_series_rtk_position_drives_live_marker() -> None:
+    """O-series getPos reports rtkPos instead of uwbPos; the marker still works."""
+    state = apply_command_data(
+        MowerState(activity=MowerActivity.MOWING),
+        "getPos",
+        {
+            "deebotPos": {"x": 120, "y": -45, "a": 30, "invalid": 0},
+            "chargePos": [{"x": 0, "y": 0, "a": 0, "t": 1, "invalid": 0}],
+            "rtkPos": [{"x": 10, "y": 20, "invalid": 0}],
+            "mid": "1",
+        },
+    )
+
+    assert state.map.current_position is not None
+    assert state.map.current_position.x == 120
+    assert state.map.uwb_positions and state.map.uwb_positions[0].x == 10
+    assert state.map.mid == "1"
+
+
+def _state_with_decoded_map(mid: str) -> MowerState:
+    """Build a state that already has decoded base map geometry for ``mid``."""
+    outline = (MapPosition(x=0, y=0), MapPosition(x=10, y=0), MapPosition(x=10, y=10))
+    return MowerState(
+        map=MowerMap(
+            mid=mid,
+            current_position=MapPosition(x=5, y=5),
+            charge_positions=(MapPosition(x=0, y=0),),
+            uwb_positions=(MapPosition(x=1, y=1),),
+            position_history=(MapPosition(x=2, y=2), MapPosition(x=3, y=3)),
+            info=MowerMapInfo(batch_id="old", outline=outline),
+            trace=MowerMapTrace(batch_id="old", path=(MapPosition(x=4, y=4),)),
+            revision=7,
+        )
+    )
+
+
+def test_remap_new_map_id_clears_stale_geometry() -> None:
+    """A new map id (mower reset + remap) drops geometry from the old map frame."""
+    state = _state_with_decoded_map("100")
+
+    state = apply_command_data(
+        state,
+        "getPos",
+        {
+            "deebotPos": {"x": 50, "y": 60, "a": 90, "invalid": 0},
+            "mid": "200",
+        },
+    )
+
+    assert state.map.mid == "200"
+    assert state.map.info.outline == ()
+    assert state.map.info.batch_id is None
+    assert state.map.trace.path == ()
+    assert state.map.position_history == ()
+    assert state.map.charge_positions == ()
+    assert state.map.uwb_positions == ()
+    assert state.map.revision > 7
+    assert state.map.current_position is not None
+    assert state.map.current_position.x == 50
+
+
+def test_same_map_id_keeps_existing_geometry() -> None:
+    """Repeated payloads for the same map id never discard decoded geometry."""
+    state = _state_with_decoded_map("100")
+
+    state = apply_command_data(
+        state,
+        "getPos",
+        {
+            "deebotPos": {"x": 50, "y": 60, "a": 90, "invalid": 0},
+            "mid": "100",
+        },
+    )
+
+    assert state.map.mid == "100"
+    assert state.map.info.outline != ()
+    assert state.map.trace.path != ()
+
+
+def test_stale_base_map_reply_is_ignored() -> None:
+    """A base map reply for a different map id must not overwrite the active map."""
+    state = _state_with_decoded_map("100")
+    original_info = state.map.info
+
+    state = apply_command_data(
+        state,
+        "onMapInfo_V2",
+        {"mid": "200", "batid": "other", "serial": "0", "type": "0", "index": 0,
+         "info": "ignored"},
+    )
+
+    assert state.map.mid == "100"
+    assert state.map.info is original_info
+    assert state.map.info.outline != ()
+
+
+def test_stale_trace_reply_is_ignored() -> None:
+    """A trace reply for a different map id must not overwrite the active trace."""
+    state = _state_with_decoded_map("100")
+    original_trace = state.map.trace
+
+    state = apply_command_data(
+        state,
+        "onMapTrace_V2",
+        {"mid": "200", "batid": "other", "serial": "0", "type": "0", "index": 0,
+         "info": "ignored"},
+    )
+
+    assert state.map.mid == "100"
+    assert state.map.trace is original_trace
+
+
+def test_trace_reply_for_active_map_is_applied() -> None:
+    """A trace reply for the active map id is accepted and updates trace metadata."""
+    state = _state_with_decoded_map("100")
+
+    state = apply_command_data(
+        state,
+        "onMapTrace_V2",
+        {"mid": "100", "batid": "fresh", "serial": "0", "type": "0", "index": 0,
+         "info": "ignored"},
+    )
+
+    assert state.map.mid == "100"
+    assert state.map.trace.batch_id == "fresh"
+
+
+def test_base_map_reply_never_switches_active_map() -> None:
+    """Only the position stream switches maps; geometry replies cannot flip it."""
+    state = _state_with_decoded_map("100")
+
+    state = apply_command_data(
+        state,
+        "onMapInfo_V2",
+        {"mid": "200", "batid": "other", "serial": "0", "type": "0", "index": 0,
+         "info": "ignored"},
+    )
+
+    assert state.map.mid == "100"
+
+
+def test_o_series_rtk_station_position_parsed() -> None:
+    """getRTK exposes the single fixed base station shown in place of beacons."""
+    state = apply_command_data(
+        MowerState(),
+        "getRTK",
+        {
+            "result": 0,
+            "rtks": [
+                {"x": 578, "y": 1997, "sn": "032888", "state": 0, "mode": 0}
+            ],
+            "observations": {"solStat": 0, "roverSvs": 33},
+        },
+    )
+
+    assert state.map.rtk_station is not None
+    assert state.map.rtk_station.x == 578
+    assert state.map.rtk_station.y == 1997
+    assert state.map.as_dict()["rtk_station"] == {"x": 578, "y": 1997, "sn": "032888"}
+
+
+def test_o_series_rtk_empty_list_keeps_no_station() -> None:
+    """An empty rtks list must not invent a station marker."""
+    state = apply_command_data(MowerState(), "getRTK", {"result": 0, "rtks": []})
+    assert state.map.rtk_station is None
+
+
+def test_o_series_map_state_learns_mid_without_decoding() -> None:
+    """O-series map payloads only contribute the map id, never bogus geometry."""
+    state = apply_command_data(
+        MowerState(),
+        "getMapTrack",
+        {"mid": "987654", "totalCount": 400, "value": "<binary-blob>"},
+    )
+
+    assert state.map.mid == "987654"
+    assert state.map.info.outline == ()
+    assert state.map.trace.path == ()
