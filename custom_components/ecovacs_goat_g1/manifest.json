@@ -5,6 +5,10 @@
     "@Janverhu"
   ],
   "config_flow": true,
+  "dependencies": [
+    "http",
+    "frontend"
+  ],
   "documentation": "https://github.com/Janverhu/ecovacs-goat-g1",
   "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/Janverhu/ecovacs-goat-g1/issues",
