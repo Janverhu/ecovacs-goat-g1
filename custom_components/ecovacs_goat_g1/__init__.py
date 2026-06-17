@@ -78,12 +78,19 @@ DEBUG_CAPTURE_EXPORT_SCHEMA = vol.Schema(
 
 async def async_setup_entry(hass: HomeAssistant, entry: EcovacsConfigEntry) -> bool:
     """Set up this integration using UI."""
+    # Register the dashboard card first, before the (slow) controller
+    # initialization. Otherwise the card's static path is unavailable for the
+    # few seconds it takes to connect, and a frontend load during that window
+    # gets a 404 that the browser/service worker caches against the versioned
+    # URL, leaving the card stuck as "Custom element doesn't exist" until the
+    # cache is cleared.
+    await async_register_frontend_card(hass)
+
     controller = EcovacsController(hass, entry)
     await controller.initialize()
     entry.runtime_data = controller
 
     _async_register_services(hass)
-    await async_register_frontend_card(hass)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
