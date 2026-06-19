@@ -616,15 +616,16 @@ class EcovacsGoatCard extends HTMLElement {
     const mower = this._state(this.config.entity);
     const mowerState = this._displayState(mower?.state || "unavailable");
     const mapState = this._state(this.config.map_entity);
+    const resolved = this._resolveMapData(mapState, mowerState);
 
     // Skip all DOM work when the underlying map data is unchanged. HA calls
     // `set hass` on every entity update, many of which never touch the map.
-    const dataSignature = this._mapDataSignature(mapState, mowerState);
+    const dataSignature = this._mapDataSignature(resolved, mowerState);
     if (dataSignature === this._lastMapDataSignature) {
       return;
     }
 
-    const render = this._computeMapRender(mapState, mowerState);
+    const render = this._computeMapRender(resolved, mowerState);
     const svg = slot.querySelector("svg");
     // When only the dynamic layers changed (trail, mowed area, mower marker)
     // patch them in place instead of rebuilding the whole SVG. Tearing down
@@ -985,8 +986,9 @@ class EcovacsGoatCard extends HTMLElement {
   }
 
   _mapPanel(mapState, mowerState) {
-    const render = this._computeMapRender(mapState, mowerState);
-    this._lastMapDataSignature = this._mapDataSignature(mapState, mowerState);
+    const resolved = this._resolveMapData(mapState, mowerState);
+    const render = this._computeMapRender(resolved, mowerState);
+    this._lastMapDataSignature = this._mapDataSignature(resolved, mowerState);
     if (!render) {
       this._lastMapStructureSignature = null;
       return "";
@@ -999,55 +1001,133 @@ class EcovacsGoatCard extends HTMLElement {
     return `<div class="map">${this._buildMapSvgHtml(render)}</div>`;
   }
 
-  // Cheap fingerprint of the raw map inputs. Used to skip rendering entirely
-  // when an unrelated `set hass` update arrives. Intentionally avoids the
-  // projection/animation work (and its side effects) in `_computeMapRender`.
-  _mapDataSignature(mapState, mowerState) {
-    const map = mapState?.attributes;
-    if (!map || mapState.state === "unavailable") {
+  // Merge each incoming map update into a persistent model, keeping the last
+  // known value for any layer the update omits. The mower's map sensor pushes
+  // sparse payloads (e.g. a position update without the garden outline), so
+  // rebuilding purely from the latest payload would make layers flash in and
+  // out. Treating the geometry as sticky keeps the map stable and robust.
+  _resolveMapData(mapState, mowerState) {
+    const model = this._mapModel || (this._mapModel = {});
+
+    // Drop the previous run's trail and mowed area the moment a fresh mow
+    // starts. "Fresh" means entering `mowing` from a non-mowing, non-paused
+    // state, so resuming from a pause keeps the existing trail.
+    const previousMowerState = this._mapMowerState;
+    this._mapMowerState = mowerState;
+    if (
+      mowerState === "mowing" &&
+      previousMowerState !== undefined &&
+      previousMowerState !== "mowing" &&
+      previousMowerState !== "paused"
+    ) {
+      delete model.position_history;
+      delete model.tracePath;
+    }
+
+    const hasAttributes =
+      !!mapState && mapState.state !== "unavailable" && !!mapState.attributes;
+
+    if (hasAttributes) {
+      const map = mapState.attributes;
+      const liveInfo = map.info || {};
+      const staticInfo = this._staticMapInfo || {};
+
+      const keep = (key, value) => {
+        if (Array.isArray(value)) {
+          if (value.length) {
+            model[key] = value;
+          }
+        } else if (value !== undefined && value !== null) {
+          model[key] = value;
+        }
+      };
+
+      keep("outline", liveInfo.outline?.length ? liveInfo.outline : staticInfo.outline);
+      keep(
+        "obstacles",
+        liveInfo.obstacles?.length ? liveInfo.obstacles : staticInfo.obstacles
+      );
+      keep("position_history", map.position_history);
+      keep("tracePath", map.trace?.path);
+      keep("current_position", map.current_position);
+      keep("charge_positions", map.charge_positions);
+      keep("uwb_positions", map.uwb_positions);
+      keep("rtk_station", map.rtk_station);
+      keep("areas", map.areas);
+      keep("no_go_zones", map.no_go_zones);
+    }
+
+    const hasGeometry = Boolean(
+      model.outline?.length ||
+        model.obstacles?.length ||
+        model.charge_positions?.length ||
+        model.uwb_positions?.length ||
+        model.areas?.length ||
+        model.no_go_zones?.length ||
+        model.position_history?.length ||
+        model.tracePath?.length ||
+        model.current_position ||
+        model.rtk_station
+    );
+
+    return {
+      available: hasAttributes || hasGeometry,
+      outline: model.outline,
+      obstacles: model.obstacles,
+      position_history: model.position_history,
+      tracePath: model.tracePath,
+      current_position: model.current_position,
+      charge_positions: model.charge_positions,
+      uwb_positions: model.uwb_positions,
+      rtk_station: model.rtk_station,
+      areas: model.areas,
+      no_go_zones: model.no_go_zones,
+    };
+  }
+
+  // Cheap fingerprint of the resolved map inputs. Used to skip rendering
+  // entirely when an unrelated `set hass` update arrives. Intentionally avoids
+  // the projection/animation work (and its side effects) in `_computeMapRender`.
+  _mapDataSignature(resolved, mowerState) {
+    if (!resolved || !resolved.available) {
       return "none";
     }
-    const liveInfo = map.info || {};
-    const info = liveInfo.outline?.length ? liveInfo : this._staticMapInfo || {};
     return JSON.stringify([
       mowerState,
-      info.outline,
-      info.obstacles,
-      map.position_history,
-      map.trace?.path,
-      map.current_position,
-      map.charge_positions,
-      map.uwb_positions,
-      map.rtk_station,
-      map.areas,
-      map.no_go_zones,
+      resolved.outline,
+      resolved.obstacles,
+      resolved.position_history,
+      resolved.tracePath,
+      resolved.current_position,
+      resolved.charge_positions,
+      resolved.uwb_positions,
+      resolved.rtk_station,
+      resolved.areas,
+      resolved.no_go_zones,
     ]);
   }
 
-  _computeMapRender(mapState, mowerState) {
-    const map = mapState?.attributes;
-    if (!map || mapState.state === "unavailable") {
+  _computeMapRender(resolved, mowerState) {
+    if (!resolved || !resolved.available) {
       return null;
     }
 
-    const liveInfo = map.info || {};
-    const info = liveInfo.outline?.length ? liveInfo : this._staticMapInfo || {};
-    const garden = this._positions(info.outline);
-    const obstacles = this._polygons(info.obstacles);
-    const livePath = this._positions(map.position_history);
-    const tracePath = this._positions(map.trace?.path);
+    const garden = this._positions(resolved.outline);
+    const obstacles = this._polygons(resolved.obstacles);
+    const livePath = this._positions(resolved.position_history);
+    const tracePath = this._positions(resolved.tracePath);
     const mowedArea = tracePath;
-    const charge = this._positions(map.charge_positions);
-    const rawCurrent = this._position(map.current_position);
+    const charge = this._positions(resolved.charge_positions);
+    const rawCurrent = this._position(resolved.current_position);
     const current = this._displayMowerPosition({
       mowerState,
       rawCurrent,
       charge,
     });
-    const beacons = this._positions(map.uwb_positions);
-    const rtkStation = this._position(map.rtk_station);
-    const areas = this._positions(map.areas);
-    const noGoZones = this._polygons(map.no_go_zones);
+    const beacons = this._positions(resolved.uwb_positions);
+    const rtkStation = this._position(resolved.rtk_station);
+    const areas = this._positions(resolved.areas);
+    const noGoZones = this._polygons(resolved.no_go_zones);
 
     const points = [
       ...garden,
