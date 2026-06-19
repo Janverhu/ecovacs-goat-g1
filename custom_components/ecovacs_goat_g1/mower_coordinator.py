@@ -23,6 +23,7 @@ from .mower_compat import (
     ProtocolProfile,
     apply_resilient_getinfo_group,
     refresh_live_position,
+    refresh_rtk_map,
 )
 from .mower_api import EcovacsApiError, EcovacsMowerApi
 from .mower_messages import (
@@ -1157,31 +1158,24 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
     async def _async_refresh_rtk_map(self, state: MowerState) -> MowerState:
         """Best-effort O-series (RTK) map refresh.
 
-        The shared position stream refreshed above already provides the live
-        marker (and the map id via ``getPos``). O-series mowers use the
-        ``getMapState`` / ``getMapTrack`` dialect rather than the G1 ``*_V2``
-        calls, so we read ``getMapState`` for build status and otherwise rely on
-        position. The ``getMapTrack`` / ``getMI`` area-outline blobs are not
-        decoded: the only available O-series capture was taken while docked
-        (``getMapTrack`` returns ``fail``), so there is no validated geometry to
-        decode. This keeps O-series mowers from spamming ``*_V2`` map errors
-        while still driving a useful live position map.
+        The shared position stream refreshed above provides the live marker (and
+        the map id via ``getPos``). O-series mowers use the ``getMapState`` /
+        ``getMapTrack`` / ``getAreaSet`` dialect rather than the G1 ``*_V2``
+        calls. We read:
+
+        * ``getMapState`` for build status,
+        * ``getRTK`` for the fixed base station position,
+        * ``getMapTrack`` for virtual walls and ``getAreaSet`` for mowing areas
+          (their ``subsets`` blobs decode with the shared LZMA decoder).
+
+        The base-map outline itself is pushed over MQTT, not returned here, so it
+        is not part of this poll. The orchestration lives in
+        :func:`.mower_compat.refresh_rtk_map` so it can be unit-tested without a
+        Home Assistant runtime.
         """
-        try:
-            response = await self.api.control(self.device, "getMapState", {})
-            state = apply_response(state, "getMapState", response)
-        except EcovacsApiError as err:
-            _LOGGER.debug("ECOVACS O-series getMapState failed: %s", err)
-            self._capture_event(
-                "rtk_map_state_error", {"exception": repr(err)}
-            )
-        try:
-            response = await self.api.control(self.device, "getRTK", {})
-            state = apply_response(state, "getRTK", response)
-        except EcovacsApiError as err:
-            _LOGGER.debug("ECOVACS O-series getRTK failed: %s", err)
-            self._capture_event("rtk_station_error", {"exception": repr(err)})
-        return state
+        return await refresh_rtk_map(
+            self.api, self.device, state, capture=self._capture_event
+        )
 
     async def _async_refresh_live_position(self, state: MowerState) -> MowerState:
         """Refresh the mower, charger, and beacon positions."""

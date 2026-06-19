@@ -583,6 +583,68 @@ def test_o_series_rtk_empty_list_keeps_no_station() -> None:
     assert state.map.rtk_station is None
 
 
+def _make_subset(obj) -> str:
+    """Build an O-series ``subsets`` blob (base64 + compact LZMA wrapper)."""
+    import base64
+    import json as _json
+    import lzma
+
+    raw = _json.dumps(obj, separators=(",", ":")).encode()
+    comp = lzma.compress(
+        raw,
+        format=lzma.FORMAT_RAW,
+        filters=[{"id": lzma.FILTER_LZMA1, "dict_size": 0x40000, "lc": 3, "lp": 0, "pb": 2}],
+    )
+    header = bytes([0x5D]) + (0x40000).to_bytes(4, "little") + len(raw).to_bytes(4, "little")
+    return base64.b64encode(header + comp).decode()
+
+
+def test_o_series_area_set_decodes_to_anchor_points() -> None:
+    """getAreaSet 'ar' subsets decode (shared LZMA) to area anchor points."""
+    subset = _make_subset([["1", "1", "Lawn", "", "100", "200", "0-0"]])
+    state = apply_command_data(
+        MowerState(),
+        "getAreaSet",
+        {"mid": "1", "aid": "0", "type": "ar", "subsets": subset, "infoSize": 1},
+    )
+
+    assert [p.as_dict() for p in state.map.areas] == [{"x": 100, "y": 200}]
+    assert state.map.mid == "1"
+
+
+def test_o_series_empty_virtual_walls_decode_to_no_zones() -> None:
+    """The real captured empty 'vw' subset decodes to no no-go zones."""
+    state = apply_command_data(
+        MowerState(),
+        "getMapTrack",
+        {
+            "mid": "1",
+            "aid": "0",
+            "type": "vw",
+            "subsets": "XQAABAACAAAAAC2XPAAAAA==",
+            "infoSize": 2,
+        },
+    )
+
+    assert state.map.no_go_zones == ()
+    assert state.map.mid == "1"
+
+
+def test_o_series_virtual_wall_polygon_best_effort_decode() -> None:
+    """A 'vw' record carrying a coordinate string yields a no-go polygon."""
+    subset = _make_subset([["1", "1", "", "", "3;10,20;30,40;50,60"]])
+    state = apply_command_data(
+        MowerState(), "getMapTrack", {"mid": "1", "type": "vw", "subsets": subset}
+    )
+
+    assert len(state.map.no_go_zones) == 1
+    assert [p.as_dict() for p in state.map.no_go_zones[0]] == [
+        {"x": 10, "y": 20},
+        {"x": 30, "y": 40},
+        {"x": 50, "y": 60},
+    ]
+
+
 def test_o_series_map_state_learns_mid_without_decoding() -> None:
     """O-series map payloads only contribute the map id, never bogus geometry."""
     state = apply_command_data(

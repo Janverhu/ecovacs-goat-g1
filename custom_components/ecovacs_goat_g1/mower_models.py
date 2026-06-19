@@ -230,6 +230,8 @@ class MowerMap:
     charge_positions: tuple[MapPosition, ...] = ()
     uwb_positions: tuple[MapPosition, ...] = ()
     rtk_station: MapPosition | None = None
+    areas: tuple[MapPosition, ...] = ()
+    no_go_zones: tuple[tuple[MapPosition, ...], ...] = ()
     position_history: tuple[MapPosition, ...] = ()
     info: MowerMapInfo = field(default_factory=MowerMapInfo)
     trace: MowerMapTrace = field(default_factory=MowerMapTrace)
@@ -246,6 +248,10 @@ class MowerMap:
             "charge_positions": [position.as_dict() for position in self.charge_positions],
             "uwb_positions": [position.as_dict() for position in self.uwb_positions],
             "rtk_station": self.rtk_station.as_dict() if self.rtk_station else None,
+            "areas": [position.as_dict() for position in self.areas],
+            "no_go_zones": [
+                [position.as_dict() for position in zone] for zone in self.no_go_zones
+            ],
             "position_history": [
                 position.as_dict()
                 for position in _sample_positions(

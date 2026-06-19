@@ -262,6 +262,17 @@ const STYLE = `
     stroke: #fff;
     stroke-width: 2;
   }
+  .map-nogo {
+    fill: rgba(229, 57, 53, 0.18);
+    stroke: #e53935;
+    stroke-width: 1.5;
+    stroke-dasharray: 4 3;
+  }
+  .map-area {
+    fill: #26a69a;
+    stroke: #fff;
+    stroke-width: 1.5;
+  }
   .map-mower {
     fill: #2196f3;
     stroke: #fff;
@@ -940,6 +951,8 @@ class EcovacsGoatCard extends HTMLElement {
     });
     const beacons = this._positions(map.uwb_positions);
     const rtkStation = this._position(map.rtk_station);
+    const areas = this._positions(map.areas);
+    const noGoZones = this._polygons(map.no_go_zones);
 
     return `
       <div class="map">
@@ -952,13 +965,17 @@ class EcovacsGoatCard extends HTMLElement {
           charge,
           beacons,
           rtkStation,
+          areas,
+          noGoZones,
           mowerState,
         })}
       </div>
     `;
   }
 
-  _mapSvg({ garden, obstacles, mowedArea, livePath, current, charge, beacons, rtkStation, mowerState }) {
+  _mapSvg({ garden, obstacles, mowedArea, livePath, current, charge, beacons, rtkStation, areas, noGoZones, mowerState }) {
+    areas = areas || [];
+    noGoZones = noGoZones || [];
     const points = [
       ...garden,
       ...obstacles.flat(),
@@ -968,6 +985,8 @@ class EcovacsGoatCard extends HTMLElement {
       ...charge,
       ...beacons,
       ...(rtkStation ? [rtkStation] : []),
+      ...areas,
+      ...noGoZones.flat(),
     ];
     if (!points.length) {
       return `<div class="map-empty">Waiting for live map data</div>`;
@@ -1006,6 +1025,19 @@ class EcovacsGoatCard extends HTMLElement {
             const point = this._project(position, bounds, width, height);
             return `
               <path class="map-station" d="${this._housePath(point.x, point.y - 10)}"></path>
+            `;
+          })
+          .join("")}
+        ${noGoZones
+          .map((zone) => this._closedPath(zone, bounds, width, height))
+          .filter(Boolean)
+          .map((path) => `<path class="map-nogo" d="${path}"></path>`)
+          .join("")}
+        ${areas
+          .map((position) => {
+            const point = this._project(position, bounds, width, height);
+            return `
+              <circle class="map-area" cx="${point.x}" cy="${point.y}" r="5"></circle>
             `;
           })
           .join("")}

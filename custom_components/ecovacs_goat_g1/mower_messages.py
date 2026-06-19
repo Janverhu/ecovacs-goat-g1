@@ -246,24 +246,27 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
         case "getMapInfo_V2" | "onMapInfo_V2":
             if isinstance(data, dict):
                 state = replace(state, map=_map_info_data(state.map, data))
+        case "getMapTrack" | "onMapTrack" | "getAreaSet" | "onAreaSet":
+            # O-series (RTK) map-set layers: virtual walls ("vw") and areas
+            # ("ar"). The ``subsets`` field is base64 + the same compact-LZMA
+            # wrapper used by the G1 V2 map, so it decodes with the shared
+            # decoder.
+            if isinstance(data, dict):
+                state = replace(state, map=_map_set_layer(state.map, data))
         case (
             "getMapState"
             | "onMapState"
-            | "getMapTrack"
-            | "onMapTrack"
             | "getMI"
             | "onMI"
-            | "getAreaSet"
-            | "onAreaSet"
             | "getSpecialContour"
             | "onSpecialContour"
             | "getMapInfo"
             | "onMapInfo"
         ):
-            # O-series (RTK) map dialect. The area-outline / trace blobs use an
-            # encoding we do not decode without a validated active-mowing
-            # capture, so we only learn the map id here; the live marker comes
-            # from getPos/onPos (deebotPos + rtkPos).
+            # O-series (RTK) map dialect. The base-map / contour geometry for
+            # these is delivered over MQTT, not in the HTTP reply, so we only
+            # learn the map id here; the live marker comes from getPos/onPos
+            # (deebotPos + rtkPos).
             if isinstance(data, dict):
                 state = replace(state, map=_map_mid_only(state.map, data))
         case "getRTK" | "onRTK":
@@ -686,14 +689,87 @@ def _rtk_station(data: dict[str, Any]) -> MapPosition | None:
 def _map_mid_only(current: MowerMap, data: dict[str, Any]) -> MowerMap:
     """Record only the map id from an O-series map payload.
 
-    The major/minor map and move-trace blobs are not decoded (their binary
-    encoding is unverified), so we keep the existing geometry and just learn the
-    current ``mid`` when present.
+    The base-map and contour geometry for these replies arrives over MQTT (the
+    HTTP reply only acknowledges), so we keep the existing geometry and just
+    learn the current ``mid`` when present.
     """
     mid = data.get("mid")
     if mid is None or str(mid) == (current.mid or ""):
         return current
     return replace(current, mid=str(mid))
+
+
+def _map_set_layer(current: MowerMap, data: dict[str, Any]) -> MowerMap:
+    """Apply an O-series map-set layer (getMapTrack/getAreaSet).
+
+    The payload is ``{mid, aid, type, subsets, infoSize}`` where ``subsets`` is a
+    base64 + compact-LZMA blob (same wrapper as the G1 V2 map). ``type`` selects
+    the layer: ``ar`` = mowing areas (anchor points), ``vw`` = virtual walls /
+    no-go zones.
+    """
+    new = current
+    mid = data.get("mid")
+    if mid is not None and not current.mid:
+        new = replace(new, mid=str(mid))
+
+    decoded = _decode_map_subset(data.get("subsets"))
+    if not isinstance(decoded, list):
+        return new
+
+    layer_type = data.get("type")
+    if layer_type == "ar":
+        new = replace(new, areas=_area_anchor_points(decoded))
+    elif layer_type == "vw":
+        new = replace(new, no_go_zones=_no_go_zone_polygons(decoded))
+    return new
+
+
+def _decode_map_subset(value: Any) -> Any:
+    """Decode an O-series ``subsets`` blob (base64 + compact LZMA) to JSON."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return _decode_lzma_json_chunks({0: value})
+    except (binascii.Error, ValueError, lzma.LZMAError, json.JSONDecodeError):
+        return None
+
+
+def _area_anchor_points(records: list[Any]) -> tuple[MapPosition, ...]:
+    """Return the anchor point of each ``ar`` area record.
+
+    Captured shape: ``["<id>","<type>","<name>","","<x>","<y>","<code>"]``.
+    """
+    points: list[MapPosition] = []
+    for record in records:
+        if not isinstance(record, list) or len(record) < 6:
+            continue
+        try:
+            points.append(MapPosition(x=int(record[4]), y=int(record[5])))
+        except (TypeError, ValueError):
+            continue
+    return tuple(points)
+
+
+def _no_go_zone_polygons(
+    records: list[Any],
+) -> tuple[tuple[MapPosition, ...], ...]:
+    """Return virtual-wall polygons from ``vw`` records (best-effort).
+
+    No populated virtual-wall capture is available yet, so we parse defensively:
+    a record contributes a polygon when it carries a semicolon-delimited
+    coordinate string; otherwise it is skipped.
+    """
+    zones: list[tuple[MapPosition, ...]] = []
+    for record in records:
+        if not isinstance(record, list):
+            continue
+        for field in record:
+            if isinstance(field, str) and ";" in field and "," in field:
+                polygon = _positions_from_coordinate_string(field)
+                if len(polygon) >= 2:
+                    zones.append(polygon)
+                break
+    return tuple(zones)
 
 
 def _map_position(data: Any) -> MapPosition | None:

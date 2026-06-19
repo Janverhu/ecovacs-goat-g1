@@ -10,6 +10,7 @@ the same HA entities and services apply; only transport details vary.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 import logging
 from typing import TYPE_CHECKING, Any
@@ -166,3 +167,53 @@ async def refresh_live_position(
                 profile = replace(profile, get_pos_fields=reduced)
                 return await refresh_live_position(api, device, state, profile)
         raise
+
+
+async def refresh_rtk_map(
+    api: EcovacsMowerApi,
+    device: MowerDevice,
+    state: MowerState,
+    *,
+    capture: Callable[[str, dict[str, Any]], None] | None = None,
+) -> MowerState:
+    """Best-effort O-series (RTK) map refresh.
+
+    Reads map build state, the fixed RTK base station, and the virtual-wall
+    (``getMapTrack``) / area (``getAreaSet``) map-set layers, whose ``subsets``
+    blobs decode with the shared LZMA decoder. Each call degrades gracefully on
+    failure. The base-map outline itself is pushed over MQTT, not returned here,
+    so it is not part of this poll. ``getAreaSet`` reuses the active map id that
+    the live position stream (``getPos``) already learned.
+    """
+    for command, payload in (("getMapState", {}), ("getRTK", {})):
+        state = await _rtk_map_call(api, device, state, command, payload, capture)
+
+    mid = state.map.mid or "0"
+    for command, payload in (
+        ("getMapTrack", {}),
+        ("getAreaSet", {"mid": mid, "aid": "0", "type": "ar"}),
+    ):
+        state = await _rtk_map_call(api, device, state, command, payload, capture)
+    return state
+
+
+async def _rtk_map_call(
+    api: EcovacsMowerApi,
+    device: MowerDevice,
+    state: MowerState,
+    command: str,
+    payload: Any,
+    capture: Callable[[str, dict[str, Any]], None] | None,
+) -> MowerState:
+    """Run one RTK map command, applying its response or logging a failure."""
+    try:
+        response = await api.control(device, command, payload)
+        return apply_response(state, command, response)
+    except EcovacsApiError as err:
+        _LOGGER.debug("ECOVACS O-series %s failed: %s", command, err)
+        if capture is not None:
+            capture(
+                "rtk_map_refresh_error",
+                {"command": command, "exception": repr(err)},
+            )
+        return state
