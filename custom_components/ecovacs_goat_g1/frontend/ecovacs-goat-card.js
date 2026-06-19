@@ -604,7 +604,6 @@ class EcovacsGoatCard extends HTMLElement {
       entityState(this.config.direction_entity),
       this._pendingAction?.key,
       this._pendingAction?.optimisticState,
-      this._keepaliveRemainingSeconds(),
     ]);
   }
 
@@ -615,8 +614,64 @@ class EcovacsGoatCard extends HTMLElement {
       return;
     }
     const mower = this._state(this.config.entity);
-    const actualState = mower?.state || "unavailable";
-    slot.innerHTML = this._mapPanel(this._state(this.config.map_entity), this._displayState(actualState));
+    const mowerState = this._displayState(mower?.state || "unavailable");
+    const mapState = this._state(this.config.map_entity);
+
+    // Skip all DOM work when the underlying map data is unchanged. HA calls
+    // `set hass` on every entity update, many of which never touch the map.
+    const dataSignature = this._mapDataSignature(mapState, mowerState);
+    if (dataSignature === this._lastMapDataSignature) {
+      return;
+    }
+
+    const render = this._computeMapRender(mapState, mowerState);
+    const svg = slot.querySelector("svg");
+    // When only the dynamic layers changed (trail, mowed area, mower marker)
+    // patch them in place instead of rebuilding the whole SVG. Tearing down
+    // and recreating the SVG (and its background) on every frame is what
+    // causes the visible flicker while mowing.
+    if (
+      render &&
+      !render.empty &&
+      svg &&
+      render.structureSignature === this._lastMapStructureSignature &&
+      this._patchMapSvg(svg, render)
+    ) {
+      this._lastMapDataSignature = dataSignature;
+      return;
+    }
+
+    if (!render) {
+      slot.innerHTML = "";
+      this._lastMapStructureSignature = null;
+    } else if (render.empty) {
+      slot.innerHTML = `<div class="map"><div class="map-empty">Waiting for live map data</div></div>`;
+      this._lastMapStructureSignature = null;
+    } else {
+      slot.innerHTML = `<div class="map">${this._buildMapSvgHtml(render)}</div>`;
+      this._lastMapStructureSignature = render.structureSignature;
+    }
+    this._lastMapDataSignature = dataSignature;
+  }
+
+  _updateKeepaliveButton() {
+    const button = this.querySelector('[data-action="keepalive"]');
+    if (!button) {
+      return;
+    }
+    const remaining = this._keepaliveRemainingSeconds();
+    const active = remaining > 0;
+    button.className = this._buttonClass(active ? "keepalive-active" : "", "keepalive");
+    const icon = button.querySelector("ha-icon");
+    if (icon) {
+      icon.setAttribute("icon", active ? "mdi:timer-sand" : "mdi:access-point-network");
+    }
+    const label = button.querySelector("span");
+    if (label) {
+      label.textContent = active
+        ? this._formatKeepaliveRemaining(remaining)
+        : "Keepalive";
+    }
   }
 
   _runStateAction(key) {
@@ -863,7 +918,7 @@ class EcovacsGoatCard extends HTMLElement {
       if (this._keepaliveRemainingSeconds() <= 0) {
         this._stopKeepaliveCountdown();
       }
-      this.render();
+      this._updateKeepaliveButton();
     }, KEEPALIVE_COUNTDOWN_TICK_MS);
   }
 
@@ -930,9 +985,49 @@ class EcovacsGoatCard extends HTMLElement {
   }
 
   _mapPanel(mapState, mowerState) {
+    const render = this._computeMapRender(mapState, mowerState);
+    this._lastMapDataSignature = this._mapDataSignature(mapState, mowerState);
+    if (!render) {
+      this._lastMapStructureSignature = null;
+      return "";
+    }
+    if (render.empty) {
+      this._lastMapStructureSignature = null;
+      return `<div class="map"><div class="map-empty">Waiting for live map data</div></div>`;
+    }
+    this._lastMapStructureSignature = render.structureSignature;
+    return `<div class="map">${this._buildMapSvgHtml(render)}</div>`;
+  }
+
+  // Cheap fingerprint of the raw map inputs. Used to skip rendering entirely
+  // when an unrelated `set hass` update arrives. Intentionally avoids the
+  // projection/animation work (and its side effects) in `_computeMapRender`.
+  _mapDataSignature(mapState, mowerState) {
     const map = mapState?.attributes;
     if (!map || mapState.state === "unavailable") {
-      return "";
+      return "none";
+    }
+    const liveInfo = map.info || {};
+    const info = liveInfo.outline?.length ? liveInfo : this._staticMapInfo || {};
+    return JSON.stringify([
+      mowerState,
+      info.outline,
+      info.obstacles,
+      map.position_history,
+      map.trace?.path,
+      map.current_position,
+      map.charge_positions,
+      map.uwb_positions,
+      map.rtk_station,
+      map.areas,
+      map.no_go_zones,
+    ]);
+  }
+
+  _computeMapRender(mapState, mowerState) {
+    const map = mapState?.attributes;
+    if (!map || mapState.state === "unavailable") {
+      return null;
     }
 
     const liveInfo = map.info || {};
@@ -954,28 +1049,6 @@ class EcovacsGoatCard extends HTMLElement {
     const areas = this._positions(map.areas);
     const noGoZones = this._polygons(map.no_go_zones);
 
-    return `
-      <div class="map">
-        ${this._mapSvg({
-          garden,
-          obstacles,
-          mowedArea,
-          livePath,
-          current,
-          charge,
-          beacons,
-          rtkStation,
-          areas,
-          noGoZones,
-          mowerState,
-        })}
-      </div>
-    `;
-  }
-
-  _mapSvg({ garden, obstacles, mowedArea, livePath, current, charge, beacons, rtkStation, areas, noGoZones, mowerState }) {
-    areas = areas || [];
-    noGoZones = noGoZones || [];
     const points = [
       ...garden,
       ...obstacles.flat(),
@@ -989,13 +1062,57 @@ class EcovacsGoatCard extends HTMLElement {
       ...noGoZones.flat(),
     ];
     if (!points.length) {
-      return `<div class="map-empty">Waiting for live map data</div>`;
+      return { empty: true };
     }
 
     const width = 360;
     const height = 300;
     const bounds = this._mapBounds(points);
+
+    // Static layers: only depend on the persistent geometry + viewport. When
+    // these are unchanged we can patch the dynamic layers in place.
     const gardenPath = this._closedPath(garden, bounds, width, height);
+    const gardenMarkup = gardenPath
+      ? `<path class="map-garden" d="${gardenPath}"></path>`
+      : "";
+    const obstacleMarkup = obstacles
+      .map((obstacle) => this._closedPath(obstacle, bounds, width, height))
+      .filter(Boolean)
+      .map((path) => `<path class="map-obstacle" d="${path}"></path>`)
+      .join("");
+    const stationMarkup = charge
+      .map((position) => {
+        const point = this._project(position, bounds, width, height);
+        return `<path class="map-station" d="${this._housePath(point.x, point.y - 10)}"></path>`;
+      })
+      .join("");
+    const noGoMarkup = noGoZones
+      .map((zone) => this._closedPath(zone, bounds, width, height))
+      .filter(Boolean)
+      .map((path) => `<path class="map-nogo" d="${path}"></path>`)
+      .join("");
+    const areaMarkup = areas
+      .map((position) => {
+        const point = this._project(position, bounds, width, height);
+        return `<circle class="map-area" cx="${point.x}" cy="${point.y}" r="5"></circle>`;
+      })
+      .join("");
+    const beaconMarkup = beacons
+      .map((position) => {
+        const point = this._project(position, bounds, width, height);
+        return `<circle class="map-beacon" cx="${point.x}" cy="${point.y}" r="6"></circle>`;
+      })
+      .join("");
+    const rtkMarkup = rtkStation
+      ? (() => {
+          const point = this._project(rtkStation, bounds, width, height);
+          return `<path class="map-rtk-station" d="M ${point.x} ${point.y - 8} L ${
+            point.x + 7
+          } ${point.y + 5} L ${point.x - 7} ${point.y + 5} Z"></path>`;
+        })()
+      : "";
+
+    // Dynamic layers: change on (almost) every position update.
     const mowedAreaPath = this._closedPath(mowedArea, bounds, width, height);
     const liveSvgPath = this._path(livePath, bounds, width, height);
     const currentPoint = current ? this._project(current, bounds, width, height) : null;
@@ -1009,68 +1126,94 @@ class EcovacsGoatCard extends HTMLElement {
       width,
       height
     );
+    const mowerMarkup = currentPoint
+      ? `<g class="map-mower-group" transform="translate(${currentPoint.x} ${currentPoint.y})">${markerAnimation}<g class="map-mower-rotate" transform="rotate(${currentHeading})"><path class="map-mower" d="M 13 0 L -9 -8 L -5 0 L -9 8 Z"></path></g></g>`
+      : "";
 
+    const structureSignature = JSON.stringify([
+      width,
+      height,
+      gardenMarkup,
+      obstacleMarkup,
+      stationMarkup,
+      noGoMarkup,
+      areaMarkup,
+      beaconMarkup,
+      rtkMarkup,
+    ]);
+
+    return {
+      width,
+      height,
+      gardenMarkup,
+      obstacleMarkup,
+      stationMarkup,
+      noGoMarkup,
+      areaMarkup,
+      beaconMarkup,
+      rtkMarkup,
+      mowedAreaPath,
+      liveSvgPath,
+      currentPoint,
+      currentHeading,
+      markerAnimation,
+      mowerMarkup,
+      structureSignature,
+    };
+  }
+
+  _buildMapSvgHtml(render) {
     return `
-      <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Live mower map">
-        ${gardenPath ? `<path class="map-garden" d="${gardenPath}"></path>` : ""}
-        ${obstacles
-          .map((obstacle) => this._closedPath(obstacle, bounds, width, height))
-          .filter(Boolean)
-          .map((path) => `<path class="map-obstacle" d="${path}"></path>`)
-          .join("")}
-        ${mowedAreaPath ? `<path class="map-mowed-area" d="${mowedAreaPath}"></path>` : ""}
-        ${liveSvgPath ? `<path class="map-trail" d="${liveSvgPath}"></path>` : ""}
-        ${charge
-          .map((position) => {
-            const point = this._project(position, bounds, width, height);
-            return `
-              <path class="map-station" d="${this._housePath(point.x, point.y - 10)}"></path>
-            `;
-          })
-          .join("")}
-        ${noGoZones
-          .map((zone) => this._closedPath(zone, bounds, width, height))
-          .filter(Boolean)
-          .map((path) => `<path class="map-nogo" d="${path}"></path>`)
-          .join("")}
-        ${areas
-          .map((position) => {
-            const point = this._project(position, bounds, width, height);
-            return `
-              <circle class="map-area" cx="${point.x}" cy="${point.y}" r="5"></circle>
-            `;
-          })
-          .join("")}
-        ${beacons
-          .map((position) => {
-            const point = this._project(position, bounds, width, height);
-            return `
-              <circle class="map-beacon" cx="${point.x}" cy="${point.y}" r="6"></circle>
-            `;
-          })
-          .join("")}
-        ${rtkStation
-          ? (() => {
-              const point = this._project(rtkStation, bounds, width, height);
-              return `
-              <path class="map-rtk-station" d="M ${point.x} ${point.y - 8} L ${
-                point.x + 7
-              } ${point.y + 5} L ${point.x - 7} ${point.y + 5} Z"></path>
-            `;
-            })()
-          : ""}
-        ${currentPoint
-          ? `
-            <g transform="translate(${currentPoint.x} ${currentPoint.y})">
-              ${markerAnimation}
-              <g transform="rotate(${currentHeading})">
-                <path class="map-mower" d="M 13 0 L -9 -8 L -5 0 L -9 8 Z"></path>
-              </g>
-            </g>
-          `
-          : ""}
+      <svg viewBox="0 0 ${render.width} ${render.height}" role="img" aria-label="Live mower map">
+        ${render.gardenMarkup}
+        ${render.obstacleMarkup}
+        <path class="map-mowed-area"${render.mowedAreaPath ? ` d="${render.mowedAreaPath}"` : ""}></path>
+        <path class="map-trail"${render.liveSvgPath ? ` d="${render.liveSvgPath}"` : ""}></path>
+        ${render.stationMarkup}
+        ${render.noGoMarkup}
+        ${render.areaMarkup}
+        ${render.beaconMarkup}
+        ${render.rtkMarkup}
+        ${render.mowerMarkup}
       </svg>
     `;
+  }
+
+  _patchMapSvg(svg, render) {
+    const group = svg.querySelector(".map-mower-group");
+    // The mower marker appeared/disappeared since the last render: fall back to
+    // a full rebuild so the element ordering stays correct.
+    if (render.currentPoint ? !group : group) {
+      return false;
+    }
+
+    const mowed = svg.querySelector(".map-mowed-area");
+    if (mowed) {
+      if (render.mowedAreaPath) {
+        mowed.setAttribute("d", render.mowedAreaPath);
+      } else {
+        mowed.removeAttribute("d");
+      }
+    }
+
+    const trail = svg.querySelector(".map-trail");
+    if (trail) {
+      if (render.liveSvgPath) {
+        trail.setAttribute("d", render.liveSvgPath);
+      } else {
+        trail.removeAttribute("d");
+      }
+    }
+
+    if (render.currentPoint && group) {
+      group.setAttribute(
+        "transform",
+        `translate(${render.currentPoint.x} ${render.currentPoint.y})`
+      );
+      group.innerHTML = `${render.markerAnimation}<g class="map-mower-rotate" transform="rotate(${render.currentHeading})"><path class="map-mower" d="M 13 0 L -9 -8 L -5 0 L -9 8 Z"></path></g>`;
+    }
+
+    return true;
   }
 
   _displayMowerPosition({ mowerState, rawCurrent, charge }) {

@@ -3,12 +3,14 @@
 The integration ships its dashboard card (``frontend/ecovacs-goat-card.js``) and
 serves it over HTTP so users do not have to copy the file into ``/config/www``
 or add a Lovelace resource by hand. The card is loaded as a frontend module with
-the integration version as a ``?v=`` cache-busting token, so when the integration
-is updated the browser automatically fetches the new card on the next load.
+a hash of the card file contents as the ``?v=`` cache-busting token, so the
+browser automatically fetches the new card whenever the file actually changes
+(and only then) - regardless of whether the integration version was bumped.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 
@@ -48,16 +50,35 @@ async def async_register_frontend_card(hass: HomeAssistant) -> None:
         # Already registered (e.g. a prior failed setup); treat as done.
         _LOGGER.debug("ECOVACS GOAT card static path already registered: %s", err)
 
-    version = await _async_card_version(hass)
-    add_extra_js_url(hass, f"{CARD_URL_PATH}?v={version}")
+    token = await _async_card_cache_token(hass, card_path)
+    add_extra_js_url(hass, f"{CARD_URL_PATH}?v={token}")
     hass.data[_REGISTERED_KEY] = True
     _LOGGER.info(
-        "Registered ECOVACS GOAT dashboard card at %s?v=%s", CARD_URL_PATH, version
+        "Registered ECOVACS GOAT dashboard card at %s?v=%s", CARD_URL_PATH, token
     )
 
 
+async def _async_card_cache_token(hass: HomeAssistant, card_path: Path) -> str:
+    """Return a cache-busting token derived from the card file contents.
+
+    Hashing the file (rather than using the integration version) guarantees the
+    browser refetches the card whenever the file actually changes - including
+    HACS beta updates that do not bump ``manifest.json`` - and never otherwise.
+    Falls back to the integration version if the file cannot be read.
+    """
+
+    def _hash() -> str:
+        return hashlib.sha256(card_path.read_bytes()).hexdigest()[:12]
+
+    try:
+        return await hass.async_add_executor_job(_hash)
+    except OSError:
+        # Cache busting is best-effort only; fall back to the integration version.
+        return await _async_card_version(hass)
+
+
 async def _async_card_version(hass: HomeAssistant) -> str:
-    """Return the integration version used to cache-bust the card URL."""
+    """Return the integration version (fallback cache-bust token)."""
     try:
         integration = await async_get_integration(hass, DOMAIN)
     except Exception:  # noqa: BLE001 - version is best-effort cache busting only
