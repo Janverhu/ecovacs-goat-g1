@@ -1,9 +1,12 @@
 name: Release
 
-# Publishes a stable GitHub release when main is updated to a stable version.
-# The version comes from manifest.json. A pre-release version (e.g. 0.2.0b1)
-# on main is ignored, so merging develop into main does not accidentally cut a
-# stable release - bump the manifest to a stable version (e.g. 0.2.0) to release.
+# Publishes a stable GitHub release when main is updated. The stable version is
+# the manifest's base version with any pre-release suffix stripped
+# (e.g. 0.3.0b1 -> stable 0.3.0), so merging the current beta line into main
+# promotes it to a release. If that version was already released the run is a
+# no-op; start the next stable line by bumping the manifest base on develop
+# (e.g. to 0.4.0b1). The computed version is written back into manifest.json and
+# committed to main so Home Assistant reports the correct installed version.
 # Development betas are handled separately by develop-prerelease.yml.
 
 on:
@@ -31,21 +34,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Read manifest version
+      - name: Compute stable version
         id: ver
         run: |
-          version="$(python -c "import json; print(json.load(open('custom_components/ecovacs_goat_g1/manifest.json'))['version'])")"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          if printf '%s' "$version" | grep -Eiq '(a|b|rc|dev)'; then
-            echo "stable=false" >> "$GITHUB_OUTPUT"
-            echo "Manifest version ${version} is a pre-release; skipping stable release."
-          else
-            echo "stable=true" >> "$GITHUB_OUTPUT"
-          fi
+          base="$(python -c "import json, re; print(re.match(r'(\d+\.\d+\.\d+)', json.load(open('custom_components/ecovacs_goat_g1/manifest.json'))['version']).group(1))")"
+          echo "version=${base}" >> "$GITHUB_OUTPUT"
+          echo "Target stable version: ${base}"
 
       - name: Check whether this version is already released
         id: tag
-        if: steps.ver.outputs.stable == 'true'
         run: |
           git fetch --tags --force
           if git rev-parse "refs/tags/${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
@@ -55,11 +52,36 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Sync manifest version and commit to main
+        id: sync
+        if: steps.tag.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python -c "
+          import json, os
+          path = 'custom_components/ecovacs_goat_g1/manifest.json'
+          data = json.load(open(path))
+          data['version'] = os.environ['VERSION']
+          with open(path, 'w') as f:
+              json.dump(data, f, indent=2)
+              f.write('\n')
+          "
+          if ! git diff --quiet -- custom_components/ecovacs_goat_g1/manifest.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add custom_components/ecovacs_goat_g1/manifest.json
+            # [skip ci] avoids re-triggering this workflow on the push back to main.
+            git commit -m "Release ${VERSION} [skip ci]"
+            git push origin HEAD:main
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Publish stable release ${{ steps.ver.outputs.version }}
-        if: steps.ver.outputs.stable == 'true' && steps.tag.outputs.exists == 'false'
+        if: steps.tag.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.ver.outputs.version }}
-          target_commitish: ${{ github.sha }}
+          target_commitish: ${{ steps.sync.outputs.sha }}
           prerelease: false
           generate_release_notes: true

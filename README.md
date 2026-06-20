@@ -64,7 +64,7 @@ Until this is available as a default HACS repository, add it manually:
 
 ### Testing pre-release (beta) builds
 
-Experimental builds — for example new model support being validated with a tester — are **automatically published as pre-releases** from the development branch (each push produces an incrementing beta such as `0.2.0b1`, `0.2.0b2`). To install one in HACS:
+Experimental builds — for example new model support being validated with a tester — are **automatically published as pre-releases** from the development branch (each push produces an incrementing beta such as `0.2.0b1`, `0.2.0b2`; only the latest beta is kept, and the line auto-advances after each stable release). See [CONTRIBUTING.md](CONTRIBUTING.md#releases--versioning) for the full release flow. To install one in HACS:
 
 1. Open **Ecovacs GOAT G1** in HACS.
 2. Three-dot menu -> **Redownload**.
