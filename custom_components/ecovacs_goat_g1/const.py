@@ -1,6 +1,9 @@
 """Ecovacs mower constants."""
 
 DOMAIN = "ecovacs_goat_g1"
+CONF_DEVICE_ID = "device_id"
+CONF_SESSION_STORE_ID = "session_store_id"
+CONF_VERIFICATION_CODE = "verification_code"
 SERVICE_REFRESH_STATE = "refresh_state"
 SERVICE_REQUEST_LIVE_POSITION_STREAM = "request_live_position_stream"
 SERVICE_START_DEBUG_CAPTURE = "start_debug_capture"

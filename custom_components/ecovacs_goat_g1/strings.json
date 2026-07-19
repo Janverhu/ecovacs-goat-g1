@@ -1,13 +1,16 @@
 {
   "config": {
     "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_account%]"
+      "already_configured": "[%key:common::config_flow::abort::already_configured_account%]",
+      "verification_session_expired": "The device-verification session expired. Start the repair flow again to request a new code."
     },
     "error": {
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
       "unknown": "[%key:common::config_flow::error::unknown%]",
-      "invalid_name": "Enter a name."
+      "invalid_name": "Enter a name.",
+      "invalid_verification_code": "The verification code is invalid or expired.",
+      "no_devices": "No ECOVACS GOAT mower was found on this account."
     },
     "step": {
       "user": {
@@ -16,6 +19,20 @@
           "country": "[%key:common::config_flow::data::country%]",
           "password": "[%key:common::config_flow::data::password%]",
           "username": "[%key:common::config_flow::data::username%]"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Verify ECOVACS client device",
+        "description": "Repair authentication for {account}. If the password changed, enter the new one; otherwise leave it blank. Home Assistant first retries normal login and sends an email code only if ECOVACS still requires device verification.",
+        "data": {
+          "password": "New password (leave blank to keep the saved password)"
+        }
+      },
+      "device_verification": {
+        "title": "Enter ECOVACS verification code",
+        "description": "Enter the one-time code ECOVACS emailed you. The code itself is never stored. The account session returned by ECOVACS is saved in Home Assistant private local storage so the integration can survive restarts.",
+        "data": {
+          "verification_code": "Verification code"
         }
       }
     }

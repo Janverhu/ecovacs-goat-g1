@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+import base64
+import binascii
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
 import hashlib
 import json
@@ -12,6 +16,8 @@ from urllib.parse import urljoin
 from uuid import uuid4
 
 from aiohttp import ClientError, ClientResponseError, ClientSession, ClientTimeout
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from .debug_capture import DebugCaptureStore
 from .mower_models import MowerDevice
@@ -28,10 +34,11 @@ AUTH_CLIENT_KEY = "1520391491841"
 # Same as above for the auth-code client.
 AUTH_CLIENT_SECRET = "77ef58ce3afbe337da74aa8c5ab963a9"  # nosemgrep
 GLOBAL_AUTHCODE_PATH = "/v1/global/auth/getAuthCode"
-USER_LOGIN_PATH_FORMAT = (
-    "/v1/private/{country}/{lang}/{deviceId}/{appCode}/{appVersion}/"
-    "{channel}/{deviceType}/user/login"
+PRIVATE_API_PATH_FORMAT = (
+    "/{apiVersion}/private/{country}/{lang}/{deviceId}/{appCode}/{appVersion}/"
+    "{channel}/{deviceType}/{endpoint}"
 )
+PUBLIC_KEY_CONFIG = "PUBLIC.KEY.CONFIG"
 META = {
     "lang": "EN",
     "appCode": "global_e",
@@ -39,6 +46,9 @@ META = {
     "channel": "google_play",
     "deviceType": "1",
 }
+VERIFICATION_META = {**META, "appVersion": "3.14.0"}
+ANDROID_MODEL = "Pixel 7"
+ANDROID_SYSTEM = "Android 14"
 TIMEOUT = ClientTimeout(total=60)
 EU_COUNTRIES = {
     "AD",
@@ -102,12 +112,37 @@ class EcovacsAuthError(EcovacsApiError):
     """Authentication failed."""
 
 
+class EcovacsInvalidAuthError(EcovacsAuthError):
+    """The ECOVACS account credentials are invalid."""
+
+
+class EcovacsDeviceVerificationRequiredError(EcovacsAuthError):
+    """The client device must be verified before authentication."""
+
+
+class EcovacsInvalidVerificationCodeError(EcovacsInvalidAuthError):
+    """The device-verification code is invalid or expired."""
+
+
+@dataclass(frozen=True)
+class AccountSession:
+    """Private ECOVACS account session returned by login or verification."""
+
+    user_id: str = field(repr=False)
+    access_token: str = field(repr=False)
+
+
+AccountSessionUpdateCallback = Callable[
+    [AccountSession | None], Awaitable[None]
+]
+
+
 @dataclass(frozen=True)
 class Credentials:
     """ECOVACS credentials."""
 
-    user_id: str
-    token: str
+    user_id: str = field(repr=False)
+    token: str = field(repr=False)
     expires_at: float
 
 
@@ -115,7 +150,7 @@ class Credentials:
 class SstToken:
     """Short-lived N-GIoT control token."""
 
-    token: str
+    token: str = field(repr=False)
     expires_at: float
 
 
@@ -130,6 +165,8 @@ class EcovacsMowerApi:
         password: str,
         country: str,
         device_id: str,
+        account_session: AccountSession | None = None,
+        account_session_update_callback: AccountSessionUpdateCallback | None = None,
         debug_capture: DebugCaptureStore | None = None,
     ) -> None:
         self._session = session
@@ -138,9 +175,20 @@ class EcovacsMowerApi:
         self._country = country.upper()
         self._device_id = device_id
         self._continent = country_continent(self._country)
+        self._account_session = account_session
+        self._account_session_update_callback = account_session_update_callback
         self._credentials: Credentials | None = None
+        self._auth_lock = asyncio.Lock()
         self._sst: dict[str, SstToken] = {}
         self._debug_capture = debug_capture
+
+        self._meta: dict[str, str] = {
+            **META,
+            "country": country_api_code(self._country),
+            "deviceId": self._device_id,
+        }
+        self._verification_meta = {**self._meta, **VERIFICATION_META}
+        self._public_key: rsa.RSAPublicKey | None = None
 
         postfix = "" if self._country == COUNTRY_CHINA else f"-{self._continent}"
         country_lower = self._country.lower()
@@ -160,26 +208,165 @@ class EcovacsMowerApi:
         """Return the client resource used for account login."""
         return self._device_id
 
+    @property
+    def account_session(self) -> AccountSession | None:
+        """Return the private account session currently held in memory."""
+        return self._account_session
+
+    def set_account_session_update_callback(
+        self, callback: AccountSessionUpdateCallback | None
+    ) -> None:
+        """Replace the private-session persistence sink."""
+        self._account_session_update_callback = callback
+
     async def authenticate(self, *, force: bool = False) -> Credentials:
         """Authenticate and cache ECOVACS account credentials."""
-        if (
-            self._credentials is None
-            or force
-            or self._credentials.expires_at < time.time()
-        ):
+        if self._credentials_are_current(force):
+            return self._credentials  # type: ignore[return-value]
+
+        async with self._auth_lock:
+            if self._credentials_are_current(force):
+                return self._credentials  # type: ignore[return-value]
+
+            if self._account_session is not None:
+                try:
+                    refreshed_session = await self._check_login(
+                        self._account_session
+                    )
+                    # The official client persists a potentially rotated raw
+                    # session before minting its IoT/portal credentials.
+                    await self._async_set_account_session(refreshed_session)
+                    self._credentials = await self._complete_login(
+                        refreshed_session.user_id,
+                        refreshed_session.access_token,
+                    )
+                    return self._credentials
+                except (
+                    EcovacsInvalidAuthError,
+                    EcovacsDeviceVerificationRequiredError,
+                ):
+                    # Only a definitive authentication response invalidates a
+                    # saved session. Transport/server errors retain it and are
+                    # allowed to propagate without a password fallback.
+                    await self._async_set_account_session(None)
+
             login_resp = await self._login_password()
-            user_id = login_resp["uid"]
-            auth_code = await self._auth_code(login_resp["accessToken"], user_id)
-            token_resp = await self._login_by_it_token(user_id, auth_code)
-            if token_resp["userId"] != user_id:
-                user_id = token_resp["userId"]
-            expires_at = time.time() + int(token_resp.get("last", 604800)) / 1000 * 0.99
-            self._credentials = Credentials(
-                user_id=user_id,
-                token=token_resp["token"],
-                expires_at=expires_at,
+            account_session = _parse_account_session(login_resp, "login")
+            # Persist the reusable account session before the secondary portal
+            # exchange.  A transient portal failure must not force another
+            # password/device-verification round trip.
+            await self._async_set_account_session(account_session)
+            try:
+                credentials = await self._complete_login(
+                    account_session.user_id,
+                    account_session.access_token,
+                )
+            except (
+                EcovacsInvalidAuthError,
+                EcovacsDeviceVerificationRequiredError,
+            ):
+                await self._async_set_account_session(None)
+                raise
+            self._credentials = credentials
+            return credentials
+
+    def _credentials_are_current(self, force: bool) -> bool:
+        """Return whether cached portal credentials can be reused."""
+        return (
+            not force
+            and self._credentials is not None
+            and self._credentials.expires_at >= time.time()
+        )
+
+    async def _async_set_account_session(
+        self, account_session: AccountSession | None
+    ) -> None:
+        """Update the in-memory session and its optional private-store sink."""
+        self._account_session = account_session
+        if self._account_session_update_callback is not None:
+            # Do not skip an equal value: retrying the sink is important if an
+            # earlier atomic write failed after the in-memory value changed.
+            await self._account_session_update_callback(account_session)
+
+    async def request_device_verification_code(self) -> None:
+        """Request a one-time email code for this stable client device ID."""
+        encrypted_email = await self._encrypt_account(self._username)
+        await self._call_private_api(
+            "user/sendEmailVerifyCode",
+            {
+                "encryptEmail": encrypted_email,
+                "verifyType": "EMAIL_VERIFY_DEVICE",
+                "supportChar": "N",
+                "isForce": "N",
+                **self._request_metadata(),
+            },
+        )
+
+    async def verify_device(self, verification_code: str) -> Credentials:
+        """Verify this stable client device ID and complete authentication."""
+        encrypted_account = await self._encrypt_account(self._username)
+        response = await self._call_private_api(
+            "user/verifyDevice",
+            {
+                "encryptAccount": encrypted_account,
+                "backUpEmail": "",
+                "verifyCode": verification_code.strip(),
+                "model": ANDROID_MODEL,
+                "system": ANDROID_SYSTEM,
+                **self._request_metadata(),
+            },
+        )
+        if not isinstance(response, dict):
+            raise EcovacsAuthError("Invalid verifyDevice response")
+        account_session = _parse_account_session(response, "verifyDevice")
+        # The verification code is single-use.  Make its returned session
+        # durable before any fallible portal exchange so setup can resume
+        # without asking the user to submit that code again.
+        await self._async_set_account_session(account_session)
+        try:
+            self._credentials = await self._complete_login(
+                account_session.user_id,
+                account_session.access_token,
             )
+        except (
+            EcovacsInvalidAuthError,
+            EcovacsDeviceVerificationRequiredError,
+        ):
+            await self._async_set_account_session(None)
+            raise
         return self._credentials
+
+    async def _check_login(self, account_session: AccountSession) -> AccountSession:
+        """Validate and rotate a persisted account session like the official app."""
+        response = await self._call_private_api(
+            "user/checkLogin",
+            {
+                "uid": account_session.user_id,
+                "accessToken": account_session.access_token,
+                **self._request_metadata(),
+            },
+            api_version="v2",
+        )
+        if not isinstance(response, dict):
+            raise EcovacsAuthError("Invalid checkLogin response")
+        return _parse_account_session(response, "checkLogin")
+
+    async def _complete_login(
+        self, user_id: str, access_token: str
+    ) -> Credentials:
+        """Exchange an ECOVACS access token for portal credentials."""
+        auth_code = await self._auth_code(access_token, user_id)
+        token_resp = await self._login_by_it_token(user_id, auth_code)
+        if token_resp["userId"] != user_id:
+            user_id = token_resp["userId"]
+        expires_at = (
+            time.time() + int(token_resp.get("last", 604800)) / 1000 * 0.99
+        )
+        return Credentials(
+            user_id=user_id,
+            token=token_resp["token"],
+            expires_at=expires_at,
+        )
 
     async def get_devices(self) -> list[MowerDevice]:
         """Return mower-like eco-ng devices from the account."""
@@ -360,20 +547,101 @@ class EcovacsMowerApi:
         return cached
 
     async def _login_password(self) -> dict[str, Any]:
-        meta = {
-            **META,
-            "country": country_api_code(self._country),
-            "deviceId": self._device_id,
-        }
         params: dict[str, str | int] = {
             "account": self._username,
             "password": self._password_hash,
-            "requestId": md5(str(time.time())),
-            "authTimespan": int(time.time() * 1000),
+            **self._request_metadata(),
+        }
+        url = urljoin(
+            self._login_url,
+            PRIVATE_API_PATH_FORMAT.format(
+                apiVersion="v1", endpoint="user/login", **self._meta
+            ),
+        )
+        response = await self._signed_get(
+            url, params, self._meta, CLIENT_KEY, CLIENT_SECRET
+        )
+        if not isinstance(response, dict):
+            raise EcovacsAuthError("Invalid login response")
+        return response
+
+    async def _call_private_api(
+        self,
+        endpoint: str,
+        params: dict[str, str | int],
+        *,
+        api_version: str = "v1",
+    ) -> Any:
+        """Call a signed private authentication endpoint."""
+        url = urljoin(
+            self._login_url,
+            PRIVATE_API_PATH_FORMAT.format(
+                apiVersion=api_version,
+                endpoint=endpoint,
+                **self._verification_meta,
+            ),
+        )
+        return await self._signed_get(
+            url,
+            params,
+            self._verification_meta,
+            CLIENT_KEY,
+            CLIENT_SECRET,
+        )
+
+    @staticmethod
+    def _request_metadata() -> dict[str, str | int]:
+        """Return per-request metadata used by ECOVACS signing."""
+        now = time.time()
+        return {
+            "requestId": md5(str(now)),
+            "authTimespan": int(now * 1000),
             "authTimeZone": "GMT-8",
         }
-        url = urljoin(self._login_url, USER_LOGIN_PATH_FORMAT.format(**meta))
-        return await self._signed_get(url, params, meta, CLIENT_KEY, CLIENT_SECRET)
+
+    async def _get_public_key(self) -> rsa.RSAPublicKey:
+        """Fetch and cache the ECOVACS account-encryption public key."""
+        if self._public_key is not None:
+            return self._public_key
+
+        response = await self._call_private_api(
+            "common/getConfig",
+            {"keys": PUBLIC_KEY_CONFIG, **self._request_metadata()},
+        )
+        if not isinstance(response, list):
+            raise EcovacsAuthError("Invalid public key configuration response")
+
+        for entry in response:
+            if not isinstance(entry, dict) or entry.get("key") != PUBLIC_KEY_CONFIG:
+                continue
+            value = entry.get("value")
+            if not isinstance(value, str):
+                break
+            try:
+                config = json.loads(value)
+                encoded_key = config["publicKey"]
+            except (KeyError, TypeError, json.JSONDecodeError) as err:
+                raise EcovacsAuthError("Invalid ECOVACS public key") from err
+            if not isinstance(encoded_key, str):
+                raise EcovacsAuthError("Invalid ECOVACS public key")
+            try:
+                key = serialization.load_der_public_key(
+                    base64.b64decode(encoded_key, validate=True)
+                )
+            except (binascii.Error, TypeError, ValueError) as err:
+                raise EcovacsAuthError("Invalid ECOVACS public key") from err
+            if not isinstance(key, rsa.RSAPublicKey):
+                raise EcovacsAuthError("ECOVACS public key is not RSA")
+            self._public_key = key
+            return key
+
+        raise EcovacsAuthError("ECOVACS public key configuration is missing")
+
+    async def _encrypt_account(self, account: str) -> str:
+        """Encrypt an account identifier for the private verification API."""
+        public_key = await self._get_public_key()
+        encrypted = public_key.encrypt(account.encode(), padding.PKCS1v15())
+        return base64.b64encode(encrypted).decode()
 
     async def _auth_code(self, access_token: str, user_id: str) -> str:
         params: dict[str, str | int] = {
@@ -407,26 +675,49 @@ class EcovacsMowerApi:
                 return response
             if response.get("result") == "fail" and response.get("error") == "set token error.":
                 continue
-            raise EcovacsAuthError(f"loginByItToken failed: {response}")
+            raise EcovacsAuthError("loginByItToken failed")
         raise EcovacsAuthError("loginByItToken failed after retries")
 
     async def _signed_get(
         self,
         url: str,
         params: dict[str, str | int],
-        extra: dict[str, str | int],
+        extra: Mapping[str, str | int],
         key: str,
         secret: str,
-    ) -> dict[str, Any]:
+    ) -> Any:
         signed = sign_params(params, extra, key, secret)
-        async with self._session.get(url, params=signed, timeout=TIMEOUT) as response:
-            response.raise_for_status()
-            result: dict[str, Any] = await response.json(content_type=None)
-        if result.get("code") == "0000":
-            return result["data"]
-        if result.get("code") in ("1005", "1010"):
-            raise EcovacsAuthError("invalid credentials")
-        raise EcovacsAuthError(f"auth call failed: {result}")
+        try:
+            async with self._session.get(
+                url, params=signed, timeout=TIMEOUT
+            ) as response:
+                response.raise_for_status()
+                result = await response.json(content_type=None)
+        except (ClientError, TimeoutError, ValueError):
+            # ClientResponseError includes the full request URL. Authentication
+            # requests carry tokens or OTPs in the query string, so deliberately
+            # suppress exception chaining before callers log this error.
+            raise EcovacsApiError("Authentication request failed") from None
+        if not isinstance(result, dict):
+            raise EcovacsAuthError("Invalid authentication response")
+
+        code = str(result.get("code", ""))
+        if code == "0000":
+            return result.get("data")
+        if code in ("1005", "1010"):
+            raise EcovacsInvalidAuthError("Invalid ECOVACS credentials")
+        if code == "1012":
+            raise EcovacsInvalidVerificationCodeError(
+                "Invalid or expired verification code"
+            )
+        if code == "1013":
+            raise EcovacsDeviceVerificationRequiredError(
+                "ECOVACS device verification required"
+            )
+        safe_code = code if code.isdigit() and len(code) <= 8 else "unknown"
+        raise EcovacsAuthError(
+            f"Authentication call failed with code {safe_code}"
+        )
 
     async def _post_authenticated(
         self, path: str, data: dict[str, Any]
@@ -453,6 +744,19 @@ class EcovacsMowerApi:
                 return result
         except ClientResponseError as err:
             raise EcovacsApiError(f"POST {path} failed") from err
+
+
+def _parse_account_session(
+    response: Mapping[str, Any], source: str
+) -> AccountSession:
+    """Return a validated raw account session without exposing its values."""
+    user_id = response.get("uid")
+    access_token = response.get("accessToken")
+    if not isinstance(user_id, str) or not user_id:
+        raise EcovacsAuthError(f"Invalid {source} response")
+    if not isinstance(access_token, str) or not access_token:
+        raise EcovacsAuthError(f"Invalid {source} response")
+    return AccountSession(user_id=user_id, access_token=access_token)
 
 
 def app_payload(data: Any) -> dict[str, Any]:
@@ -505,7 +809,7 @@ def _raise_for_control_error(command: str, result: Any) -> None:
 
 def sign_params(
     params: dict[str, str | int],
-    extra: dict[str, str | int],
+    extra: Mapping[str, str | int],
     key: str,
     secret: str,
 ) -> dict[str, str | int]:

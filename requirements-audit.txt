@@ -2,4 +2,7 @@
 # custom_components/ecovacs_goat_g1/manifest.json and .github/workflows/validate.yml.
 paho-mqtt==2.1.0
 pytest
+pytest-asyncio
 aiohttp
+cryptography
+voluptuous

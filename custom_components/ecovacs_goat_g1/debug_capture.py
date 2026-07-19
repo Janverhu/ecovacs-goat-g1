@@ -18,6 +18,7 @@ DEFAULT_RETAINED_SESSIONS = 3
 REDACTED = "<redacted>"
 REDACT_KEYS = {
     "accessToken",
+    "access_token",
     "auth",
     "authCode",
     "authorization",
@@ -31,6 +32,7 @@ REDACT_KEYS = {
     "resource",
     "token",
     "uid",
+    "user_id",
     "userId",
     "userid",
 }
@@ -272,7 +274,8 @@ class DebugCaptureStore:
             "max_bytes": self._session.max_bytes,
         }
         (self._session.path / "manifest.json").write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
+            json.dumps(self._redact(_json_safe(manifest)), indent=2),
+            encoding="utf-8",
         )
 
     def _stop_locked(self, reason: str) -> None:
@@ -283,7 +286,10 @@ class DebugCaptureStore:
         manifest = _read_json(manifest_path)
         manifest["stopped_at"] = _utc_now()
         manifest["stop_reason"] = reason
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        manifest_path.write_text(
+            json.dumps(self._redact(_json_safe(manifest)), indent=2),
+            encoding="utf-8",
+        )
         self._session = None
         self._event_path = None
 

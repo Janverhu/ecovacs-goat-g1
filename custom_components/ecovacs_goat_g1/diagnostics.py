@@ -9,10 +9,13 @@ from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 
 from . import EcovacsConfigEntry
+from .const import CONF_DEVICE_ID, CONF_SESSION_STORE_ID
 
 REDACT_CONFIG = {
     CONF_USERNAME,
     CONF_PASSWORD,
+    CONF_DEVICE_ID,
+    CONF_SESSION_STORE_ID,
     "title",
 }
 REDACT_DEVICE = {"did", "name", "nick", "homeId"}

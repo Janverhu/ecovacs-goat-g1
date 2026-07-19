@@ -14,6 +14,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv, entity_registry as er
 
 from .const import (
+    CONF_SESSION_STORE_ID,
     DOMAIN,
     SERVICE_CLEAR_DEBUG_CAPTURE,
     SERVICE_EXPORT_DEBUG_CAPTURE,
@@ -25,6 +26,8 @@ from .const import (
 )
 from .controller import EcovacsController
 from .frontend import async_register_frontend_card
+from .session_store import async_remove_account_session_store
+from .util import migrate_config_data
 
 PLATFORMS = [
     Platform.BUTTON,
@@ -76,6 +79,20 @@ DEBUG_CAPTURE_EXPORT_SCHEMA = vol.Schema(
 )
 
 
+async def async_migrate_entry(
+    hass: HomeAssistant, entry: EcovacsConfigEntry
+) -> bool:
+    """Persist stable protocol and private-session-store identifiers."""
+    if entry.version > 4:
+        return False
+
+    data = migrate_config_data(entry.data)
+    if entry.version < 4 or data != dict(entry.data):
+        hass.config_entries.async_update_entry(entry, data=data, version=4)
+
+    return True
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: EcovacsConfigEntry) -> bool:
     """Set up this integration using UI."""
     # Register the dashboard card first, before the (slow) controller
@@ -101,6 +118,21 @@ async def async_unload_entry(hass: HomeAssistant, entry: EcovacsConfigEntry) -> 
     if unload_ok:
         await entry.runtime_data.teardown()
     return unload_ok
+
+
+async def async_remove_entry(
+    hass: HomeAssistant, entry: EcovacsConfigEntry
+) -> None:
+    """Delete the private account session when its config entry is removed."""
+    # Removal can proceed even if platform unload failed. Drain and tombstone
+    # the controller here as well so no late callback can recreate the store.
+    try:
+        if controller := getattr(entry, "runtime_data", None):
+            await controller.teardown()
+    finally:
+        await async_remove_account_session_store(
+            hass, entry.data.get(CONF_SESSION_STORE_ID)
+        )
 
 
 def _async_register_services(hass: HomeAssistant) -> None:

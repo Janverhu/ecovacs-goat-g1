@@ -77,6 +77,15 @@ To return to a stable build later, redownload and pick the latest non-beta versi
 
 You need your ECOVACS account username, password, and country. The integration uses the ECOVACS cloud, just like the official app.
 
+If ECOVACS asks Home Assistant to verify its client device, the emailed one-time
+code is used once and is never stored. The account session returned by ECOVACS
+is kept in a separate Home Assistant private store (`0600`, atomic writes), not
+in the config entry or diagnostics. It is removed when the integration entry is
+deleted and is protected by Home Assistant backup encryption when included in
+an encrypted backup. This is operating-system access control, not encryption
+against Home Assistant itself or a host administrator, so protect the HA host
+and use encrypted backups.
+
 During setup, choose a Home Assistant device name. A generated default such as `Ecovacs-GOAT-1` is provided.
 
 ## Optional Dashboard Card
