@@ -10,7 +10,6 @@ import voluptuous as vol
 
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_COUNTRY, CONF_NAME, CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import HomeAssistant
 from homeassistant.helpers import aiohttp_client, selector
 from homeassistant.helpers.typing import VolDictType
 
@@ -23,53 +22,29 @@ from .const import (
     OPTION_DEBUG_CAPTURE_MAX_SIZE_MB,
     OPTION_DEBUG_CAPTURE_RAW_PAYLOADS,
 )
-from .mower_api import EcovacsApiError, EcovacsAuthError, EcovacsMowerApi
+from .mower_api import (
+    EcovacsApiError,
+    EcovacsAuthError,
+    EcovacsDeviceVerificationRequiredError,
+    EcovacsInvalidVerificationCodeError,
+    EcovacsMowerApi,
+)
 from .util import get_client_device_id
 
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_NAME_PREFIX = "Ecovacs-GOAT"
-
-
-async def _validate_input(
-    hass: HomeAssistant, user_input: dict[str, Any]
-) -> dict[str, str]:
-    """Validate user input."""
-    errors: dict[str, str] = {}
-    if not str(user_input.get(CONF_NAME, "")).strip():
-        errors[CONF_NAME] = "invalid_name"
-        return errors
-
-    device_id = get_client_device_id(hass)
-    api = EcovacsMowerApi(
-        aiohttp_client.async_get_clientsession(hass),
-        username=user_input[CONF_USERNAME],
-        password=user_input[CONF_PASSWORD],
-        country=user_input[CONF_COUNTRY],
-        device_id=device_id,
-    )
-
-    try:
-        await api.authenticate()
-        devices = await api.get_devices()
-    except EcovacsAuthError:
-        errors["base"] = "invalid_auth"
-    except (ClientError, EcovacsApiError):
-        _LOGGER.debug("Cannot connect", exc_info=True)
-        errors["base"] = "cannot_connect"
-    except Exception:
-        _LOGGER.exception("Unexpected exception during login")
-        errors["base"] = "unknown"
-
-    if not errors and not devices:
-        errors["base"] = "unknown"
-
-    return errors
+CONF_VERIFICATION_CODE = "verification_code"
 
 
 class EcovacsConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Ecovacs."""
 
     VERSION = 1
+
+    def __init__(self) -> None:
+        """Initialize the config flow."""
+        self._user_input: dict[str, Any] | None = None
+        self._api: EcovacsMowerApi | None = None
 
     @staticmethod
     def async_get_options_flow(config_entry: ConfigEntry) -> EcovacsOptionsFlow:
@@ -80,7 +55,7 @@ class EcovacsConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Handle the initial step."""
-        errors = {}
+        errors: dict[str, str] = {}
 
         if user_input:
             self._async_abort_entries_match({CONF_USERNAME: user_input[CONF_USERNAME]})
@@ -89,12 +64,45 @@ class EcovacsConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_NAME: str(user_input[CONF_NAME]).strip(),
             }
 
-            errors = await _validate_input(self.hass, user_input)
-
-            if not errors:
-                return self.async_create_entry(
-                    title=user_input[CONF_NAME], data=user_input
+            if not user_input[CONF_NAME]:
+                errors[CONF_NAME] = "invalid_name"
+            else:
+                api = EcovacsMowerApi(
+                    aiohttp_client.async_get_clientsession(self.hass),
+                    username=user_input[CONF_USERNAME],
+                    password=user_input[CONF_PASSWORD],
+                    country=user_input[CONF_COUNTRY],
+                    device_id=get_client_device_id(self.hass),
                 )
+
+                try:
+                    await api.authenticate()
+                    devices = await api.get_devices()
+                except EcovacsDeviceVerificationRequiredError:
+                    self._user_input = user_input
+                    self._api = api
+                    try:
+                        await api.request_device_verification_code()
+                    except (ClientError, EcovacsApiError):
+                        _LOGGER.debug("Cannot send verification code", exc_info=True)
+                        errors["base"] = "cannot_connect"
+                    else:
+                        return await self.async_step_verify_device()
+                except EcovacsAuthError:
+                    errors["base"] = "invalid_auth"
+                except (ClientError, EcovacsApiError):
+                    _LOGGER.debug("Cannot connect", exc_info=True)
+                    errors["base"] = "cannot_connect"
+                except Exception:
+                    _LOGGER.exception("Unexpected exception during login")
+                    errors["base"] = "unknown"
+                else:
+                    if not devices:
+                        errors["base"] = "unknown"
+                    else:
+                        return self.async_create_entry(
+                            title=user_input[CONF_NAME], data=user_input
+                        )
 
         schema: VolDictType = {
             vol.Required(CONF_NAME): selector.TextSelector(
@@ -121,6 +129,46 @@ class EcovacsConfigFlow(ConfigFlow, domain=DOMAIN):
                 data_schema=vol.Schema(schema), suggested_values=user_input
             ),
             errors=errors,
+            last_step=True,
+        )
+
+    async def async_step_verify_device(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle the one-time email device-verification code."""
+        errors: dict[str, str] = {}
+        assert self._api is not None
+        assert self._user_input is not None
+
+        if user_input is not None:
+            try:
+                await self._api.verify_device(user_input[CONF_VERIFICATION_CODE])
+                devices = await self._api.get_devices()
+            except EcovacsInvalidVerificationCodeError:
+                errors["base"] = "invalid_verification_code"
+            except EcovacsAuthError:
+                errors["base"] = "invalid_auth"
+            except (ClientError, EcovacsApiError):
+                _LOGGER.debug("Cannot connect", exc_info=True)
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected exception during device verification")
+                errors["base"] = "unknown"
+            else:
+                if not devices:
+                    errors["base"] = "unknown"
+                else:
+                    return self.async_create_entry(
+                        title=self._user_input[CONF_NAME], data=self._user_input
+                    )
+
+        return self.async_show_form(
+            step_id="verify_device",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_VERIFICATION_CODE): selector.TextSelector()}
+            ),
+            errors=errors,
+            description_placeholders={"email": self._user_input[CONF_USERNAME]},
             last_step=True,
         )
 

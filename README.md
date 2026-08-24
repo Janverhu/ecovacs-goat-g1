@@ -79,6 +79,12 @@ You need your ECOVACS account username, password, and country. The integration u
 
 During setup, choose a Home Assistant device name. A generated default such as `Ecovacs-GOAT-1` is provided.
 
+If ECOVACS has not seen this Home Assistant device before, it may require one-time email
+verification: after entering your credentials you'll be asked for a code emailed to your account.
+Enter it to finish setup — verification is tied to this integration's device id (derived from your
+Home Assistant instance name), so it should not be required again on future logins from the same
+instance.
+
 ## Optional Dashboard Card
 
 The custom card is optional, but recommended. It exposes a clear stop button and a mower-focused map layout.

@@ -7,7 +7,8 @@
       "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
       "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
       "unknown": "[%key:common::config_flow::error::unknown%]",
-      "invalid_name": "Enter a name."
+      "invalid_name": "Enter a name.",
+      "invalid_verification_code": "That verification code is invalid or has expired."
     },
     "step": {
       "user": {
@@ -16,6 +17,13 @@
           "country": "[%key:common::config_flow::data::country%]",
           "password": "[%key:common::config_flow::data::password%]",
           "username": "[%key:common::config_flow::data::username%]"
+        }
+      },
+      "verify_device": {
+        "title": "Verify this device",
+        "description": "Ecovacs sent a one-time verification code to {email}. Enter it below to finish setup.",
+        "data": {
+          "verification_code": "Verification code"
         }
       }
     }
