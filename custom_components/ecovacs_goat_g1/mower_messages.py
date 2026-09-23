@@ -237,6 +237,11 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
                         record_history=state.activity in POSITION_HISTORY_ACTIVITIES,
                     ),
                 )
+        case "onFwBuryPoint-bd_basicinfo" | "onFwBuryPoint-bd_locationjump":
+            # O1200 LiDAR Pro leaves getPos at the origin. The live point is
+            # this telemetry string (x,y and a height/flag the map does not use).
+            if isinstance(data, dict):
+                state = _apply_telemetry_position(state, data)
         case "getUWB" | "onUWB":
             if isinstance(data, dict):
                 state = replace(state, map=_map_uwb_data(state.map, data))
@@ -490,11 +495,78 @@ def _error_activity(code: int | None, state: MowerState) -> MowerActivity:
     return MowerActivity.ERROR
 
 
+def _unfixed_origin(position: MapPosition | None, data: dict[str, Any]) -> bool:
+    """Return whether a getPos origin is the LiDAR placeholder, not a real fix.
+
+    O1200 LiDAR Pro answers getPos with deebotPos at 0,0 and an empty rtkPos
+    list while it is mowing. That placeholder must not pin the marker, and must
+    not replace a telemetry point. A G1 or RTK reading that also carries beacons
+    is left alone, including a real dock at the origin.
+    """
+    if position is None or position.x or position.y:
+        return False
+    return not _map_positions(data.get("uwbPos")) and not _map_positions(
+        data.get("rtkPos")
+    )
+
+
+def _apply_telemetry_position(state: MowerState, data: dict[str, Any]) -> MowerState:
+    """Apply an O1200 LiDAR telemetry point to the live marker."""
+    points = [
+        position
+        for key in ("prev", "robotPos", "curr")
+        if (position := _csv_position(data.get(key))) is not None
+    ]
+    charger = _csv_position(data.get("chargerPos"))
+    if not points and charger is None:
+        return state
+
+    mower_map = state.map
+    history = mower_map.position_history
+    if state.activity in POSITION_HISTORY_ACTIVITIES:
+        for position in points:
+            if not history or history[-1].x != position.x or history[-1].y != position.y:
+                history = (*history, position)
+    return replace(
+        state,
+        map=replace(
+            mower_map,
+            current_position=points[-1] if points else mower_map.current_position,
+            charge_positions=(charger,) if charger is not None else mower_map.charge_positions,
+            position_history=history,
+            revision=mower_map.revision + 1,
+        ),
+    )
+
+
+def _csv_position(value: Any) -> MapPosition | None:
+    """Parse ``x,y,...`` telemetry into a map point.
+
+    The first two fields are the map coordinates. Later fields are height and
+    flags. An all-zero point is the stationary placeholder and is ignored.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) < 2:
+        return None
+    try:
+        x = int(round(float(parts[0])))
+        y = int(round(float(parts[1])))
+    except ValueError:
+        return None
+    if x == 0 and y == 0:
+        return None
+    return MapPosition(x=x, y=y)
+
+
 def _map_position_data(
     current: MowerMap, data: dict[str, Any], *, record_history: bool
 ) -> MowerMap:
     """Merge mower, station, and beacon positions into the map cache."""
     mower_position = _map_position(data.get("deebotPos"))
+    if _unfixed_origin(mower_position, data):
+        mower_position = None
     charge_positions = _map_positions(data.get("chargePos"))
     # G1 reports UWB beacon positions; O-series (RTK) reports rtkPos instead.
     uwb_positions = _map_positions(data.get("uwbPos")) or _map_positions(
@@ -559,7 +631,10 @@ def _map_trace_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
     chunks = dict(trace.chunks)
     if index is not None and isinstance(info, str):
         chunks[index] = info
-    path = _decode_trace_path(chunks) or trace.path
+    if _map_chunks_ready(chunks, _int(serial)):
+        path = _decode_trace_path(chunks) or trace.path
+    else:
+        path = trace.path
 
     return replace(
         current,
@@ -585,6 +660,12 @@ def _map_trace_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
 
 def _map_info_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
     """Merge chunked onMapInfo_V2 data into the base map cache."""
+    # The map screen keeps a piece only when using is 1. Other copies are
+    # inactive and must not enter the chunk set.
+    using = _int(data.get("using"))
+    if using is not None and using != 1:
+        return current
+
     batch_id = str(data.get("batid")) if data.get("batid") is not None else None
     serial = str(data.get("serial")) if data.get("serial") is not None else None
     map_type = str(data.get("type")) if data.get("type") is not None else None
@@ -606,7 +687,16 @@ def _map_info_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
     if index is not None and isinstance(info, str):
         chunks[index] = info
 
-    outline, obstacles = _decode_base_map(chunks)
+    if _map_chunks_ready(chunks, _int(serial)):
+        decoded_outline, decoded_obstacles = _decode_base_map(chunks)
+    else:
+        decoded_outline, decoded_obstacles = (), ()
+    # An incomplete follow-up chunk must not erase a lawn that already decoded.
+    # Replace the outline only when the new chunk set actually produces one.
+    if decoded_outline:
+        outline, obstacles = decoded_outline, decoded_obstacles
+    else:
+        outline, obstacles = current.info.outline, current.info.obstacles
 
     return replace(
         current,
@@ -620,8 +710,8 @@ def _map_info_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
             info_size=_int(data.get("infoSize")) or map_info.info_size,
             type=map_type or map_info.type,
             chunks=chunks,
-            outline=outline or map_info.outline,
-            obstacles=obstacles or map_info.obstacles,
+            outline=outline,
+            obstacles=obstacles,
         ),
         last_update_ts=_int(data.get("_mqtt_ts")) or current.last_update_ts,
     )
@@ -846,14 +936,155 @@ def _decode_base_map(
     return outline, tuple(obstacles)
 
 
+def map_geometry_health(mower_map: MowerMap) -> dict[str, Any]:
+    """Return whether map geometry decoded, without coordinates or identifiers.
+
+    Diagnostics and logs can show this directly. It includes chunk indexes,
+    sizes, and the decoder status only.
+    """
+    return {
+        "info": _layer_health(
+            mower_map.info.chunks,
+            mower_map.info.info_size,
+            mower_map.info.serial,
+            outline_points=len(mower_map.info.outline),
+            obstacle_count=len(mower_map.info.obstacles),
+        ),
+        "trace": _layer_health(
+            mower_map.trace.chunks,
+            mower_map.trace.info_size,
+            mower_map.trace.serial,
+            path_points=len(mower_map.trace.path),
+        ),
+        "position_history_points": len(mower_map.position_history),
+        "has_current_position": mower_map.current_position is not None,
+        "charge_position_count": len(mower_map.charge_positions),
+    }
+
+
+def _layer_health(
+    chunks: dict[int, str],
+    info_size: int | None,
+    serial: str | None,
+    **counts: int,
+) -> dict[str, Any]:
+    indexes = sorted(chunks)
+    health: dict[str, Any] = {
+        "chunk_indexes": indexes,
+        "chunk_chars": [len(chunks[index]) for index in indexes],
+        "info_size": info_size,
+        "decode": _chunk_decode_status(chunks, _int(serial)),
+        **counts,
+    }
+    reindexed = _reindexed_layer_facts(chunks)
+    if reindexed is not None:
+        health["reindexed"] = reindexed
+    return health
+
+
+def _reindexed_layer_facts(chunks: dict[int, str]) -> dict[str, Any] | None:
+    """Try a 1-based chunk set as if it had been numbered from 0.
+
+    This does not change the stored map. It only reports whether the bytes
+    would decode, so a numbering mismatch can be told apart from a missing chunk.
+    """
+    indexes = sorted(chunks)
+    if not indexes or indexes[0] == 0:
+        return None
+    if indexes != list(range(indexes[0], indexes[-1] + 1)):
+        return None
+    shifted = {index - indexes[0]: chunks[index] for index in indexes}
+    status = _chunk_decode_status(shifted)
+    facts: dict[str, Any] = {"decode": status}
+    if status == "ok":
+        outline, obstacles = _decode_base_map(shifted)
+        facts["outline_points"] = len(outline)
+        facts["obstacle_count"] = len(obstacles)
+    return facts
+
+
+def _map_chunks_ready(chunks: dict[int, str], serial: int | None) -> bool:
+    """Return whether a chunk set is complete enough to decode.
+
+    When ``serial`` is a positive piece count, indexes ``0`` through
+    ``serial - 1`` must all be present. Otherwise a contiguous set that starts
+    at 0 is enough, which covers a single unchunked blob.
+    """
+    if not chunks:
+        return False
+    indexes = sorted(chunks)
+    if serial is not None and serial > 0:
+        return indexes == list(range(serial))
+    return indexes == list(range(indexes[-1] + 1))
+
+
+def _chunk_decode_status(
+    chunks: dict[int, str], serial: int | None = None
+) -> str | None:
+    """Return a secret-free decoder status for one chunk set."""
+    if not chunks:
+        return None
+    if not _map_chunks_ready(chunks, serial):
+        return "ValueError: Incomplete chunks"
+    try:
+        _decode_lzma_json_chunks(chunks)
+    except json.JSONDecodeError:
+        # A partial chunk set is not valid JSON yet. The message can quote
+        # decoded text, so keep the type only.
+        return "JSONDecodeError"
+    except ValueError as err:
+        return f"ValueError: {err}"
+    except (binascii.Error, lzma.LZMAError) as err:
+        return type(err).__name__
+    return "ok"
+
+
 def _decode_lzma_json_chunks(chunks: dict[int, str]) -> Any:
-    """Decode ECOVACS' compact LZMA chunk wrapper into JSON."""
+    """Decode ECOVACS' compact LZMA chunk wrapper into JSON.
+
+    The app joins ``info`` strings in index order and base64-decodes that one
+    string. A reply that base64-encodes each piece separately is accepted too.
+    """
     if not chunks:
         raise ValueError("No chunks")
     indexes = sorted(chunks)
     if indexes != list(range(indexes[-1] + 1)):
         raise ValueError("Incomplete chunks")
-    raw = b"".join(base64.b64decode(chunks[index]) for index in indexes)
+    pieces = [chunks[index] for index in indexes]
+    errors: list[BaseException] = []
+    for raw in (
+        _base64_bytes("".join(pieces)),
+        _base64_bytes_per_piece(pieces),
+    ):
+        if raw is None:
+            continue
+        try:
+            return _json_from_lzma_bytes(raw)
+        except (ValueError, lzma.LZMAError, json.JSONDecodeError) as err:
+            errors.append(err)
+    if errors:
+        raise errors[0]
+    raise ValueError("Chunk payload too small")
+
+
+def _base64_bytes(value: str) -> bytes | None:
+    try:
+        return base64.b64decode(value, validate=False)
+    except binascii.Error:
+        return None
+
+
+def _base64_bytes_per_piece(pieces: list[str]) -> bytes | None:
+    parts: list[bytes] = []
+    for piece in pieces:
+        decoded = _base64_bytes(piece)
+        if decoded is None:
+            return None
+        parts.append(decoded)
+    return b"".join(parts)
+
+
+def _json_from_lzma_bytes(raw: bytes) -> Any:
     if len(raw) < 10:
         raise ValueError("Chunk payload too small")
     props = raw[0]

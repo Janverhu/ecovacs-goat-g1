@@ -139,7 +139,7 @@ _O_SERIES_PROFILE = CapabilityProfile(
     stop_content_type="auto",
     clean_always_content=True,
     clean_info_command="getCleanInfo",
-    position_fields=("deebotPos", "chargePos"),
+    position_fields=("chargePos", "deebotPos", "rtkPos"),
     experimental=True,
     label="GOAT O-series (RTK, getMapTrack dialect, experimental)",
 )

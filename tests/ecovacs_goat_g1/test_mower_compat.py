@@ -22,6 +22,7 @@ from custom_components.ecovacs_goat_g1.mower_compat import (
     GETINFO_UNSUPPORTED_FAILURE_THRESHOLD,
     ProtocolProfile,
     apply_resilient_getinfo_group,
+    control_command_unsupported,
     refresh_live_position,
     refresh_rtk_map,
 )
@@ -225,3 +226,15 @@ async def test_refresh_rtk_map_survives_command_failures() -> None:
     assert [p.as_dict() for p in state.map.areas] == [{"x": 5, "y": 6}]
     assert len(events) == 3
     assert all(event == "rtk_map_refresh_error" for event, _ in events)
+
+
+def test_trace_unsupported_is_distinct_from_other_failures() -> None:
+    """A trace 20003 is unsupported; an unrelated failure is not."""
+    unsupported = EcovacsApiError(
+        "Control command getMapTrace_V2 failed with code 20003: rcp not support"
+    )
+    transient = EcovacsApiError("Control command getMapInfo_V2 failed with code 500")
+
+    assert control_command_unsupported(unsupported)
+    assert not control_command_unsupported(transient)
+    assert ProtocolProfile().map_trace_uses_v2 is True

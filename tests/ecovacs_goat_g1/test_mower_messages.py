@@ -20,6 +20,7 @@ from custom_components.ecovacs_goat_g1.mower_messages import (
     apply_command_data,
     apply_mqtt_payload,
     apply_response,
+    map_geometry_health,
 )
 from custom_components.ecovacs_goat_g1.mower_models import (
     MapPosition,
@@ -656,3 +657,229 @@ def test_o_series_map_state_learns_mid_without_decoding() -> None:
     assert state.map.mid == "987654"
     assert state.map.info.outline == ()
     assert state.map.trace.path == ()
+
+
+def test_lidar_telemetry_robot_pos_moves_the_marker() -> None:
+    """O1200 LiDAR Pro publishes the live point as a robotPos string."""
+    state = apply_command_data(
+        MowerState(activity=MowerActivity.MOWING),
+        "onFwBuryPoint-bd_basicinfo",
+        {"robotPos": "10.4, -3.6, 0.1, 0", "workState": 1},
+    )
+
+    assert state.map.current_position is not None
+    assert state.map.current_position.as_dict() == {"x": 10, "y": -4}
+    assert [point.as_dict() for point in state.map.position_history] == [
+        {"x": 10, "y": -4}
+    ]
+
+
+def test_lidar_origin_getpos_does_not_replace_telemetry() -> None:
+    """A getPos stuck at the origin must not wipe a telemetry fix."""
+    state = apply_command_data(
+        MowerState(activity=MowerActivity.MOWING),
+        "onFwBuryPoint-bd_locationjump",
+        {"prev": "1.2, 2.2, 0", "curr": "4.6, 8.2, 0"},
+    )
+    state = apply_command_data(
+        state,
+        "getPos",
+        {
+            "deebotPos": {"x": 0, "y": 0, "a": 0, "invalid": 0},
+            "chargePos": [{"x": 0, "y": 0, "invalid": 1}],
+            "rtkPos": [],
+            "mid": "1",
+        },
+    )
+
+    assert state.map.current_position is not None
+    assert state.map.current_position.as_dict() == {"x": 5, "y": 8}
+    assert [point.as_dict() for point in state.map.position_history] == [
+        {"x": 1, "y": 2},
+        {"x": 5, "y": 8},
+    ]
+
+
+def test_zero_robot_pos_is_ignored() -> None:
+    """The stationary robotPos placeholder is not a map point."""
+    state = apply_command_data(
+        MowerState(),
+        "onFwBuryPoint-bd_basicinfo",
+        {"robotPos": "0.000000,0.000000,0.000000,0"},
+    )
+
+    assert state.map.current_position is None
+
+
+def test_incomplete_map_chunk_keeps_existing_outline() -> None:
+    """A partial base-map update must not erase a lawn that already decoded."""
+    outline = (
+        MapPosition(x=0, y=0),
+        MapPosition(x=10, y=0),
+        MapPosition(x=10, y=10),
+    )
+    state = MowerState(map=MowerMap(info=MowerMapInfo(batch_id="old", outline=outline)))
+
+    state = apply_command_data(
+        state,
+        "onMapInfo_V2",
+        {
+            "batid": "new",
+            "serial": "1",
+            "type": "0",
+            "index": 1,
+            "info": "not-a-complete-map",
+        },
+    )
+
+    assert state.map.info.outline == outline
+
+
+def test_map_geometry_health_hides_incomplete_chunk_payload(caplog: pytest.LogCaptureFixture) -> None:
+    """A chunk set that does not start at 0 is reported without its contents."""
+    secret = "this-map-chunk-must-not-appear-in-diagnostics"
+    state = apply_command_data(
+        MowerState(),
+        "onMapInfo_V2",
+        {
+            "batid": "secret-batch",
+            "serial": "1",
+            "type": "0",
+            "index": 1,
+            "infoSize": 10043,
+            "info": secret,
+        },
+    )
+
+    health = map_geometry_health(state.map)
+    rendered = str(health)
+    assert health["info"]["chunk_indexes"] == [1]
+    assert health["info"]["chunk_chars"] == [len(secret)]
+    assert health["info"]["info_size"] == 10043
+    assert health["info"]["outline_points"] == 0
+    assert health["info"]["decode"] == "ValueError: Incomplete chunks"
+    assert "decode" in health["info"]["reindexed"]
+    assert secret not in rendered
+    assert "secret-batch" not in rendered
+    assert secret not in caplog.text
+    assert "secret-batch" not in caplog.text
+    assert "produced no lawn outline" not in caplog.text
+
+
+def test_map_geometry_health_accepts_a_complete_zero_based_chunk() -> None:
+    """Index 0 still decodes to a lawn outline and reports success."""
+    payload = [["1", ";0,0;10,0;10,10"]]
+    state = apply_command_data(
+        MowerState(),
+        "onMapInfo_V2",
+        {
+            "batid": "batch",
+            "serial": "0",
+            "type": "0",
+            "index": 0,
+            "info": _make_subset(payload),
+        },
+    )
+
+    health = map_geometry_health(state.map)
+    assert health["info"]["chunk_indexes"] == [0]
+    assert health["info"]["decode"] == "ok"
+    assert health["info"]["outline_points"] == 3
+
+
+def test_map_info_ignores_inactive_using_flag() -> None:
+    """A piece with using other than 1 is not part of the active lawn."""
+    state = apply_command_data(
+        MowerState(),
+        "onMapInfo_V2",
+        {
+            "batid": "batch",
+            "serial": 1,
+            "type": "0",
+            "index": 0,
+            "using": 0,
+            "info": _make_subset([["1", ";0,0;10,0;10,10"]]),
+        },
+    )
+
+    assert state.map.info.chunks == {}
+    assert state.map.info.outline == ()
+
+
+def test_map_info_decodes_only_after_serial_pieces_are_joined() -> None:
+    """Info strings are joined, then base64-decoded once, when serial is met."""
+    blob = _make_subset([["1", ";0,0;4,0;4,4"]])
+    first, second = blob[:1], blob[1:]
+    piece = {
+        "batid": "batch",
+        "serial": 2,
+        "type": "0",
+        "using": 1,
+    }
+
+    state = apply_command_data(
+        MowerState(),
+        "onMapInfo_V2",
+        {**piece, "index": 0, "info": first},
+    )
+    assert state.map.info.outline == ()
+
+    state = apply_command_data(
+        state,
+        "onMapInfo_V2",
+        {**piece, "index": 1, "info": second},
+    )
+    assert [point.as_dict() for point in state.map.info.outline] == [
+        {"x": 0, "y": 0},
+        {"x": 4, "y": 0},
+        {"x": 4, "y": 4},
+    ]
+
+
+def test_map_info_accepts_separately_encoded_pieces() -> None:
+    """Each piece may be its own base64 string of one slice of the LZMA blob."""
+    import base64
+    import json as _json
+    import lzma
+
+    raw = _json.dumps([["1", ";1,2;3,4;5,6"]], separators=(",", ":")).encode()
+    compressed = lzma.compress(
+        raw,
+        format=lzma.FORMAT_RAW,
+        filters=[
+            {
+                "id": lzma.FILTER_LZMA1,
+                "dict_size": 0x40000,
+                "lc": 3,
+                "lp": 0,
+                "pb": 2,
+            }
+        ],
+    )
+    blob = bytes([0x5D]) + (0x40000).to_bytes(4, "little") + len(raw).to_bytes(4, "little")
+    blob += compressed
+    midpoint = max(1, len(blob) // 2)
+    pieces = (
+        base64.b64encode(blob[:midpoint]).decode(),
+        base64.b64encode(blob[midpoint:]).decode(),
+    )
+    state = MowerState()
+    for index, info in enumerate(pieces):
+        state = apply_command_data(
+            state,
+            "onMapInfo_V2",
+            {
+                "batid": "batch",
+                "serial": 2,
+                "type": "0",
+                "using": 1,
+                "index": index,
+                "info": info,
+            },
+        )
+
+    assert [point.as_dict() for point in state.map.info.outline] == [
+        {"x": 1, "y": 2},
+        {"x": 3, "y": 4},
+        {"x": 5, "y": 6},
+    ]
