@@ -97,11 +97,12 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: EcovacsConfigEntry) -> bool:
     """Set up this integration using UI."""
     # Register the dashboard card first, before the (slow) controller
-    # initialization. Otherwise the card's static path is unavailable for the
-    # few seconds it takes to connect, and a frontend load during that window
-    # gets a 404 that the browser/service worker caches against the versioned
-    # URL, leaving the card stuck as "Custom element doesn't exist" until the
-    # cache is cleared.
+    # initialization. Storage-mode Lovelace needs the module resource before
+    # it creates cards. The static path also has to exist during the few
+    # seconds it takes to connect, or a frontend load in that window gets a
+    # 404 that the browser/service worker caches against the versioned URL
+    # and the card stays "Custom element doesn't exist" until the cache is
+    # cleared.
     await async_register_frontend_card(hass)
 
     controller = EcovacsController(hass, entry)

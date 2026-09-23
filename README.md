@@ -85,7 +85,7 @@ ECOVACS now requires a one-time **email device verification** for Home Assistant
 
 The custom card is optional, but recommended. It exposes a clear stop button and a mower-focused map layout.
 
-**No manual install is needed.** The integration bundles the card and registers it with Home Assistant automatically: it serves `ecovacs-goat-card.js` from the integration and loads it as a frontend module, versioned to the integration release so browsers pick up updates after each upgrade (a hard refresh may be needed once).
+**No manual install is needed.** The integration bundles the card and serves `ecovacs-goat-card.js` from the integration. On a storage-mode dashboard, setup adds a **module** resource for that file under **Settings → Dashboards → Resources**, so Lovelace loads the card before it creates cards. The resource URL includes a content hash of the card file (`?v=`), and setup updates that resource when the file changes. When dashboard resources are YAML-only, setup loads the same URL as an extra frontend module.
 
 Just add **Ecovacs GOAT Card** from the custom card picker (you may need to reload the dashboard once after first install).
 
