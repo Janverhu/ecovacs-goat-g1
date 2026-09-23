@@ -22,6 +22,7 @@ from .mower_profiles import MapDialect, profile_for_model
 from .mower_compat import (
     ProtocolProfile,
     apply_resilient_getinfo_group,
+    control_command_unsupported,
     refresh_live_position,
     refresh_rtk_map,
 )
@@ -32,6 +33,7 @@ from .mower_messages import (
     apply_command_data,
     apply_mqtt_payload,
     apply_response,
+    map_geometry_health,
 )
 from .mower_models import MapPosition, MowerActivity, MowerDevice, MowerState
 from .mower_mqtt import MowerAppPresenceMqttClient, MowerMqttClient
@@ -39,7 +41,9 @@ from .mower_mqtt import MowerAppPresenceMqttClient, MowerMqttClient
 _LOGGER = logging.getLogger(__name__)
 FRESH_STATE_SECONDS = 300
 MAP_TRACE_TYPE = "0"
-APP_LIVE_MAP_TYPES = ("ar", "vw", "fe")
+# Area and virtual-wall layers from the live-position stream. Type ``fe`` is
+# rejected on this mower (code 20003, unknown type) and is not requested.
+APP_LIVE_MAP_TYPES = ("ar", "vw")
 MQTT_READBACK_DEBOUNCE_SECONDS = 3
 MAP_TRACE_DIRECTION_THRESHOLD_DEGREES = 90
 MAP_TRACE_POSITION_HEADING_MIN_DISTANCE = 20
@@ -55,6 +59,8 @@ MOWING_POSITION_REFRESH_SECONDS = 60
 POSITION_MQTT_STALE_SECONDS = 60
 MAP_HISTORY_STORE_VERSION = 1
 MAP_HISTORY_STORE_DELAY_SECONDS = 5
+MAX_BASE_MAP_INFO_REQUESTS = 3
+BASE_MAP_SETTLE_SECONDS = 15
 
 # Polling policy:
 # - Prefer MQTT pushes for normal state and live movement. In particular, onPos
@@ -209,6 +215,11 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         self._app_presence_stop_task: asyncio.Task[None] | None = None
         self._app_presence_stop_at: float | None = None
         self._startup_live_map_task: asyncio.Task[None] | None = None
+        self._base_map_settle_task: asyncio.Task[None] | None = None
+        self._map_info_mid: str | None = None
+        self._map_info_requests = 0
+        self._logged_incomplete_base_map: tuple[int, ...] | None = None
+        self._device_mqtt_ready = False
         self._last_live_position_stream_request_at: float | None = None
         self._live_map_request_counter = 0
         self._stop_unsub: Callable[[], None] | None = None
@@ -218,6 +229,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             hass, MAP_HISTORY_STORE_VERSION, store_key
         )
         self._saved_position_history: tuple[MapPosition, ...] = ()
+        self._saved_outline: tuple[MapPosition, ...] = ()
+        self._saved_obstacles: tuple[tuple[MapPosition, ...], ...] = ()
         self._mqtt = MowerMqttClient(
             api,
             device,
@@ -234,15 +247,26 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
 
     async def async_start(self) -> None:
         """Start push subscription after initial state refresh."""
-        position_history = await self._async_load_position_history()
-        if position_history:
+        position_history, outline, obstacles = await self._async_load_saved_map()
+        if position_history or outline or obstacles:
             self.data = replace(
                 self.data,
-                map=replace(self.data.map, position_history=position_history),
+                map=replace(
+                    self.data.map,
+                    position_history=position_history or self.data.map.position_history,
+                    info=replace(
+                        self.data.map.info,
+                        outline=outline or self.data.map.info.outline,
+                        obstacles=obstacles or self.data.map.info.obstacles,
+                    ),
+                ),
             )
-            self._saved_position_history = position_history
+            self._saved_position_history = self.data.map.position_history
+            self._saved_outline = self.data.map.info.outline
+            self._saved_obstacles = self.data.map.info.obstacles
         await self.async_config_entry_first_refresh()
         await self._mqtt.start()
+        self._device_mqtt_ready = True
         self._stop_unsub = self.hass.bus.async_listen_once(
             EVENT_HOMEASSISTANT_STOP, self._async_handle_hass_stop
         )
@@ -286,6 +310,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             self._app_presence_stop_task.cancel()
         if self._startup_live_map_task and not self._startup_live_map_task.done():
             self._startup_live_map_task.cancel()
+        if self._base_map_settle_task and not self._base_map_settle_task.done():
+            self._base_map_settle_task.cancel()
         for task in self._outcome_refresh_tasks.values():
             task.cancel()
         await asyncio.gather(
@@ -300,6 +326,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                     self._live_position_keepalive_task,
                     self._app_presence_stop_task,
                     self._startup_live_map_task,
+                    self._base_map_settle_task,
                     *self._outcome_refresh_tasks.values(),
                 )
                 if task
@@ -316,9 +343,10 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         self._app_presence_stop_task = None
         self._app_presence_stop_at = None
         self._startup_live_map_task = None
+        self._base_map_settle_task = None
         self._outcome_refresh_tasks.clear()
         await self._app_presence_mqtt.stop()
-        await self._map_history_store.async_save(self._position_history_payload())
+        await self._map_history_store.async_save(self._saved_map_payload())
         await self._mqtt.stop()
 
     async def _async_handle_hass_stop(self, _event: Event) -> None:
@@ -327,9 +355,9 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         await self.async_stop()
 
     def async_set_updated_data(self, data: MowerState) -> None:
-        """Set coordinator data and persist the last mowing path."""
+        """Set coordinator data and persist the lawn outline and mowing path."""
         super().async_set_updated_data(data)
-        self._schedule_position_history_save(data.map.position_history)
+        self._schedule_saved_map(data)
 
     @property
     def debug_capture(self) -> DebugCaptureStore:
@@ -337,39 +365,88 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         assert self._debug_capture is not None
         return self._debug_capture
 
-    async def _async_load_position_history(self) -> tuple[MapPosition, ...]:
-        """Restore the last mowing path from HA storage."""
+    async def _async_load_saved_map(
+        self,
+    ) -> tuple[
+        tuple[MapPosition, ...],
+        tuple[MapPosition, ...],
+        tuple[tuple[MapPosition, ...], ...],
+    ]:
+        """Restore the last lawn outline and mowing path from HA storage."""
         stored = await self._map_history_store.async_load()
         if not isinstance(stored, dict):
+            return (), (), ()
+        return (
+            self._positions_from_stored(stored.get("position_history")),
+            self._positions_from_stored(stored.get("outline")),
+            tuple(
+                polygon
+                for item in stored.get("obstacles", [])
+                if isinstance(item, list)
+                for polygon in (self._positions_from_stored(item),)
+                if polygon
+            ),
+        )
+
+    @staticmethod
+    def _positions_from_stored(items: Any) -> tuple[MapPosition, ...]:
+        """Return stored map points, ignoring malformed entries."""
+        if not isinstance(items, list):
             return ()
         return tuple(
             position
-            for item in stored.get("position_history", [])
+            for item in items
             if isinstance(item, dict)
             for position in (MapPosition.from_payload(item),)
             if position is not None
         )
 
-    def _schedule_position_history_save(
-        self, position_history: tuple[MapPosition, ...]
-    ) -> None:
-        """Debounce writes of the last mowing path to HA storage."""
-        if position_history == self._saved_position_history:
+    def _schedule_saved_map(self, data: MowerState) -> None:
+        """Debounce writes of the lawn outline and last mowing path."""
+        outline_arrived = (
+            bool(data.map.info.outline)
+            and data.map.info.outline != self._saved_outline
+        )
+        if (
+            data.map.position_history == self._saved_position_history
+            and data.map.info.outline == self._saved_outline
+            and data.map.info.obstacles == self._saved_obstacles
+        ):
             return
-        self._saved_position_history = position_history
+        self._saved_position_history = data.map.position_history
+        self._saved_outline = data.map.info.outline
+        self._saved_obstacles = data.map.info.obstacles
+        if outline_arrived:
+            # Position updates would otherwise keep postponing this write.
+            self.hass.async_create_task(self._async_save_map_now())
+            return
         self._map_history_store.async_delay_save(
-            self._position_history_payload,
+            self._saved_map_payload,
             MAP_HISTORY_STORE_DELAY_SECONDS,
         )
 
-    def _position_history_payload(self) -> dict[str, Any]:
-        """Return the persisted map history payload."""
-        position_history = self.data.map.position_history if self.data else ()
+    async def _async_save_map_now(self) -> None:
+        """Write the lawn outline immediately."""
+        await self._map_history_store.async_save(self._saved_map_payload())
+
+    def _saved_map_payload(self) -> dict[str, Any]:
+        """Return the persisted map payload. Coordinates stay on this Home Assistant."""
+        map_state = self.data.map if self.data else None
+        position_history = map_state.position_history if map_state else ()
+        outline = map_state.info.outline if map_state else ()
+        obstacles = map_state.info.obstacles if map_state else ()
         return {
-            "position_history": [
-                position.as_dict() for position in position_history
+            "position_history": [position.as_dict() for position in position_history],
+            "outline": [position.as_dict() for position in outline],
+            "obstacles": [
+                [position.as_dict() for position in polygon] for polygon in obstacles
             ],
         }
+
+    async def _async_load_position_history(self) -> tuple[MapPosition, ...]:
+        """Restore the last mowing path from HA storage."""
+        position_history, _outline, _obstacles = await self._async_load_saved_map()
+        return position_history
 
     async def _async_update_data(self) -> MowerState:
         """Refresh from the mower using a small app-style command set."""
@@ -424,6 +501,25 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                     if self._trace_path_changed(previous_state, state):
                         state = self._reset_live_position_segment(state)
                         self._mark_trace_mqtt_applied()
+                if (
+                    previous_state
+                    and previous_state.map.mid != state.map.mid
+                ):
+                    self._map_info_mid = state.map.mid
+                    self._map_info_requests = 0
+                    self._logged_incomplete_base_map = None
+                if command in {"onMapInfo_V2", "getMapInfo_V2"}:
+                    if (
+                        previous_state
+                        and not previous_state.map.info.outline
+                        and state.map.info.outline
+                    ):
+                        _LOGGER.info(
+                            "ECOVACS base map outline ready (%s points from %s chunks)",
+                            len(state.map.info.outline),
+                            len(state.map.info.chunks),
+                        )
+                    self._schedule_base_map_settle_log()
                 self.async_set_updated_data(state)
                 self._capture_event(
                     "mqtt_parsed",
@@ -573,7 +669,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         await asyncio.sleep(0.5)
         if not self.data or not self.data.map.mid or not self._trace_update_due:
             return
-        if not self._protocol.map_api_uses_v2:
+        if not self._protocol.map_trace_uses_v2:
             return
         try:
             response = await self.api.control(
@@ -597,7 +693,15 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 },
             )
         except EcovacsApiError as err:
-            _LOGGER.debug("ECOVACS trace refresh after turn failed: %s", err)
+            if control_command_unsupported(err):
+                self._protocol = replace(self._protocol, map_trace_uses_v2=False)
+                _LOGGER.warning(
+                    "ECOVACS map trace request unavailable; "
+                    "base map requests are unchanged: %s",
+                    err,
+                )
+            else:
+                _LOGGER.debug("ECOVACS trace refresh after turn failed: %s", err)
             self._capture_event(
                 "trace_refresh_after_turn_error",
                 {"exception": repr(err)},
@@ -889,36 +993,59 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             return state
 
         trace_changed = False
-        if self._protocol.map_api_uses_v2:
+        if self._protocol.map_api_uses_v2 or self._protocol.map_trace_uses_v2:
             try:
-                await self.api.control(
-                    self.device,
-                    "getMapSet_V2",
-                    self._app_live_map_payload(mid, "ar"),
-                )
-                previous_state = state
-                response = await self.api.control(
-                    self.device,
-                    "getMapTrace_V2",
-                    self._app_live_map_payload(mid, MAP_TRACE_TYPE),
-                )
-                state = apply_response(state, "getMapTrace_V2", response)
-                trace_changed = self._trace_path_changed(previous_state, state)
-                if trace_changed:
-                    state = self._reset_live_position_segment(state)
-                    self._mark_trace_mqtt_applied()
-
-                for map_type in APP_LIVE_MAP_TYPES[1:]:
+                if self._protocol.map_api_uses_v2:
                     await self.api.control(
                         self.device,
                         "getMapSet_V2",
-                        self._app_live_map_payload(mid, map_type),
+                        self._app_live_map_payload(mid, "ar"),
                     )
-                await self.api.control(
-                    self.device,
-                    "getMapPoint",
-                    {"mid": mid, "bdTaskID": self._next_app_bd_task_id()},
-                )
+                if self._protocol.map_trace_uses_v2:
+                    try:
+                        previous_state = state
+                        response = await self.api.control(
+                            self.device,
+                            "getMapTrace_V2",
+                            self._app_live_map_payload(mid, MAP_TRACE_TYPE),
+                        )
+                        state = apply_response(state, "getMapTrace_V2", response)
+                        trace_changed = self._trace_path_changed(previous_state, state)
+                        if trace_changed:
+                            state = self._reset_live_position_segment(state)
+                            self._mark_trace_mqtt_applied()
+                    except EcovacsApiError as err:
+                        if not control_command_unsupported(err):
+                            raise
+                        self._protocol = replace(
+                            self._protocol, map_trace_uses_v2=False
+                        )
+                        _LOGGER.warning(
+                            "ECOVACS map trace request unavailable; "
+                            "base map requests are unchanged: %s",
+                            err,
+                        )
+                if self._protocol.map_api_uses_v2:
+                    for map_type in APP_LIVE_MAP_TYPES[1:]:
+                        try:
+                            await self.api.control(
+                                self.device,
+                                "getMapSet_V2",
+                                self._app_live_map_payload(mid, map_type),
+                            )
+                        except EcovacsApiError as err:
+                            if not control_command_unsupported(err):
+                                raise
+                            _LOGGER.debug(
+                                "ECOVACS map set type %s is unsupported: %s",
+                                map_type,
+                                err,
+                            )
+                    await self.api.control(
+                        self.device,
+                        "getMapPoint",
+                        {"mid": mid, "bdTaskID": self._next_app_bd_task_id()},
+                    )
             except EcovacsApiError as err:
                 _LOGGER.warning(
                     "ECOVACS live map stream V2 calls failed; using position/MQTT only: %s",
@@ -1117,43 +1244,107 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         if self._capability.map_dialect is MapDialect.MAP_RTK:
             return await self._async_refresh_rtk_map(state)
 
-        if not self._protocol.map_api_uses_v2:
+        if not state.map.mid:
+            return state
+        state = await self._async_request_base_map(state)
+        if not self._protocol.map_trace_uses_v2:
             return state
         try:
-            if state.map.mid:
-                if not state.map.info.outline:
-                    map_info_payload: dict[str, Any] = {
-                        "mid": state.map.mid,
-                        "using": 0,
-                        "serial": 0,
-                        "index": 0,
-                        "type": MAP_TRACE_TYPE,
-                    }
-                    if state.task_id:
-                        map_info_payload["bdTaskID"] = state.task_id
-                    response = await self.api.control(
-                        self.device,
-                        "getMapInfo_V2",
-                        map_info_payload,
-                    )
-                    state = apply_response(state, "getMapInfo_V2", response)
-                response = await self.api.control(
-                    self.device,
-                    "getMapTrace_V2",
-                    {"mid": state.map.mid, "type": MAP_TRACE_TYPE},
-                )
-                state = apply_response(state, "getMapTrace_V2", response)
+            response = await self.api.control(
+                self.device,
+                "getMapTrace_V2",
+                {"mid": state.map.mid, "type": MAP_TRACE_TYPE},
+            )
+            state = apply_response(state, "getMapTrace_V2", response)
         except EcovacsApiError as err:
-            if self._protocol.map_api_uses_v2:
+            if control_command_unsupported(err):
+                self._protocol = replace(self._protocol, map_trace_uses_v2=False)
                 _LOGGER.warning(
-                    "ECOVACS map V2 control API unavailable for this device; "
-                    "continuing with MQTT/position-only map updates: %s",
+                    "ECOVACS map trace request unavailable; "
+                    "base map requests are unchanged: %s",
                     err,
                 )
-                self._protocol = replace(self._protocol, map_api_uses_v2=False)
             else:
-                _LOGGER.debug("ECOVACS live map refresh failed: %s", err)
+                _LOGGER.debug("ECOVACS map trace request failed: %s", err)
         return state
+
+    async def _async_request_base_map(self, state: MowerState) -> MowerState:
+        """Ask for the lawn outline when it is missing, at most a few times per map.
+
+        ``getMapTrace_V2`` being unsupported must not stop these requests. Once
+        the outline is stored, or the per-map limit is reached, nothing further
+        is sent.
+        """
+        if (
+            not self._device_mqtt_ready
+            or not self._protocol.map_api_uses_v2
+            or state.map.info.outline
+            or not state.map.mid
+        ):
+            return state
+        if self._map_info_mid != state.map.mid:
+            self._map_info_mid = state.map.mid
+            self._map_info_requests = 0
+            self._logged_incomplete_base_map = None
+        if self._map_info_requests >= MAX_BASE_MAP_INFO_REQUESTS:
+            return state
+        # ECOVACS HOME's GOAT map screen sends getMapInfo_V2 with type "0" only.
+        # The lawn arrives afterwards as onMapInfo_V2 pieces.
+        self._map_info_requests += 1
+        had_outline = bool(state.map.info.outline)
+        try:
+            response = await self.api.control(
+                self.device,
+                "getMapInfo_V2",
+                {"type": "0"},
+            )
+        except EcovacsApiError as err:
+            _LOGGER.debug("ECOVACS base map request failed: %s", err)
+            return state
+        state = apply_response(state, "getMapInfo_V2", response)
+        if not had_outline and state.map.info.outline:
+            _LOGGER.info(
+                "ECOVACS base map outline ready (%s points from %s chunks)",
+                len(state.map.info.outline),
+                len(state.map.info.chunks),
+            )
+        elif not state.map.info.outline:
+            self._schedule_base_map_settle_log()
+        return state
+
+    def _schedule_base_map_settle_log(self) -> None:
+        """Log one outline failure after map pieces stop arriving."""
+        if self._base_map_settle_task and not self._base_map_settle_task.done():
+            self._base_map_settle_task.cancel()
+        self._base_map_settle_task = self._create_background_task(
+            self._async_log_base_map_if_incomplete(),
+            "ecovacs_goat_base_map_settle",
+        )
+
+    async def _async_log_base_map_if_incomplete(self) -> None:
+        """Warn once when a quiet period still has no lawn outline."""
+        try:
+            await asyncio.sleep(BASE_MAP_SETTLE_SECONDS)
+            state = self.data
+            if (
+                state is None
+                or state.map.info.outline
+                or not state.map.info.chunks
+            ):
+                return
+            indexes = tuple(sorted(state.map.info.chunks))
+            if indexes == self._logged_incomplete_base_map:
+                return
+            self._logged_incomplete_base_map = indexes
+            _LOGGER.warning(
+                "ECOVACS base map still has no lawn outline: %s",
+                map_geometry_health(state.map)["info"],
+            )
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._base_map_settle_task is asyncio.current_task():
+                self._base_map_settle_task = None
 
     async def _async_refresh_rtk_map(self, state: MowerState) -> MowerState:
         """Best-effort O-series (RTK) map refresh.
@@ -1191,7 +1382,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             self.async_set_updated_data(
                 await self._async_refresh_live_map(self.data or self._base_state())
             )
-            if self.data and self.data.map.trace.path:
+            if self.data and self.data.map.info.outline:
                 return
 
     def _has_fresh_state(self) -> bool:

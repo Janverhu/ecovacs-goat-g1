@@ -43,7 +43,7 @@ def test_o_series_profile_matches_o800_rtk_capture() -> None:
     assert profile.experimental is True
     assert profile.clean_command == "clean"
     assert profile.clean_info_command == "getCleanInfo"
-    assert profile.position_fields == ("deebotPos", "chargePos")
+    assert profile.position_fields == ("chargePos", "deebotPos", "rtkPos")
 
 
 def test_g1_clean_body_matches_legacy_behaviour() -> None:

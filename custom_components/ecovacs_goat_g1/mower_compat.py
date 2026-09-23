@@ -30,11 +30,22 @@ GETINFO_CLEAN_FALLBACKS: dict[str, str] = {"getCleanInfo_V2": "getCleanInfo"}
 GETINFO_UNSUPPORTED_FAILURE_THRESHOLD = 3
 
 
+def control_command_unsupported(err: BaseException) -> bool:
+    """Return whether ECOVACS rejected a command as unsupported.
+
+    Code 20003 (``rcp not support``) means this mower does not implement that
+    command. Callers must disable only that command, not every map request.
+    """
+    text = str(err)
+    return "code 20003" in text or "not support" in text.lower()
+
+
 @dataclass(frozen=True)
 class ProtocolProfile:
     """Learned command preferences for one device."""
 
     map_api_uses_v2: bool = True
+    map_trace_uses_v2: bool = True
     get_pos_fields: tuple[str, ...] = ("chargePos", "deebotPos", "uwbPos")
     unsupported_getinfo: frozenset[str] = frozenset()
     getinfo_failures: dict[str, int] = field(default_factory=dict)
@@ -43,6 +54,7 @@ class ProtocolProfile:
         """Return a JSON-serialisable snapshot for diagnostics."""
         return {
             "map_api_uses_v2": self.map_api_uses_v2,
+            "map_trace_uses_v2": self.map_trace_uses_v2,
             "get_pos_fields": list(self.get_pos_fields),
             "unsupported_getinfo": sorted(self.unsupported_getinfo),
             "getinfo_failures": dict(sorted(self.getinfo_failures.items())),

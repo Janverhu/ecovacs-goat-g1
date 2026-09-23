@@ -17,7 +17,11 @@ mowers speak **two dialects**. The integration models this with a per-device
 - **GOAT G1 line** (`family = goat_g1`): UWB beacons with the `*_V2` dialect —
   `clean_V2`, `getCleanInfo_V2`, `getMapInfo_V2` / `getMapTrace_V2`, and
   `uwbPos` positions. This is the validated path and the default for unknown
-  models, so existing setups never regress.
+  models, so existing setups never regress. The GOAT map screen requests the
+  lawn with `getMapInfo_V2` and body `{"type": "0"}` only. Active pieces have
+  `using` `1`. A set is complete when `serial` is the piece count and indexes
+  `0` .. `serial - 1` are all present. Those `info` strings are joined in index
+  order and decoded once as base64 plus LZMA.
 - **GOAT O-series** (`family = goat_o_series`, **experimental**): confirmed
   against a decrypted **GOAT O800 RTK** capture (class `9bts2s`, model
   `GOAT_O800_LC`, fw `1.9.10`):
@@ -25,7 +29,13 @@ mowers speak **two dialects**. The integration models this with a per-device
     stop body uses `content.type = "auto"` (G1 uses `""`).
   - `getCleanInfo` (not `getCleanInfo_V2`) — **same status fields**
     (`state`, `cleanState.motionState`, `trigger`, nested `cleanState.cid`).
-  - `getPos` returns `deebotPos` / `chargePos` / **`rtkPos`** (no `uwbPos`).
+  - `getPos` asks for `chargePos`, `deebotPos`, and `rtkPos` (no `uwbPos`).
+    On the O1200 LiDAR Pro those fields stay at the origin with no RTK fix.
+    The live point is the `robotPos` string on `onFwBuryPoint-bd_basicinfo`,
+    and `curr` on `onFwBuryPoint-bd_locationjump`.
+  - Return to dock is `charge` with `act` `go` and leaves the Auto task open.
+    Ending the task, which lets the next schedule start, is `clean` with
+    `act` `stop`. A null HTTP body on `clean` is a successful fire-and-forget.
   - `getRTK` returns the single fixed **base station** (`rtks[0].x/y/sn`) plus
     GNSS signal `observations`; the station is shown on the map where the G1
     shows UWB beacons.
@@ -36,12 +46,12 @@ Dock (`charge {act:"go"}`), `appping`, `getLifeSpan`, battery, and error are
 shared. The capability profile picks the command names / map dialect; the runtime
 profile in `mower_compat.py` still adapts on failures.
 
-The O-series area-outline / trace blobs (`getMapTrack`, `getMI`, `getAreaSet`)
-are **not decoded**: the only available O-series capture was taken while docked,
-where `getMapTrack` returns `fail`, so there is no validated geometry sample. The
-O-series live map is driven by the shared position stream (`deebotPos` + `rtkPos`)
-instead; the map id (`mid`) is still learned so a future active-mowing capture can
-complete the outline decode.
+`getAreaSet` type `ar` decodes to area anchor points. The lawn outline pushed
+on `getMapTrack`, `getMI`, `onMI`, `onArI`, and `onSpecialContour` is still
+not decoded: no capture yet includes those bodies. The map id is learned so a
+later capture can complete that decode. An RTK fix uses `deebotPos` and
+`rtkPos`. A LiDAR `getPos` stuck at the origin is ignored in favor of
+`robotPos`.
 
 - Device commands use the N-GIoT endpoint `/api/iot/endpoint/control` with `apn=<command>` and `fmt=j`.
 - Command bodies use the app-style envelope with header version `0.0.22`.

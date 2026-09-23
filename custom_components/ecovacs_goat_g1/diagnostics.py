@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant
 
 from . import EcovacsConfigEntry
 from .const import CONF_ACCESS_TOKEN, CONF_ACCOUNT_UID, CONF_SESSION_STORE_ID
+from .mower_messages import map_geometry_health
 
 REDACT_CONFIG = {
     CONF_USERNAME,
@@ -38,6 +39,10 @@ async def async_get_config_entry_diagnostics(
     ]
     diag["protocol_profiles"] = [
         coordinator.protocol_profile for coordinator in controller.coordinators
+    ]
+    diag["map_health"] = [
+        map_geometry_health(coordinator.data.map) if coordinator.data else None
+        for coordinator in controller.coordinators
     ]
     diag["debug_capture"] = {
         "summary": controller.debug_capture.summary(),
