@@ -85,3 +85,30 @@ jobs:
           target_commitish: ${{ steps.sync.outputs.sha }}
           prerelease: false
           generate_release_notes: true
+
+      - name: Merge the stable manifest back into develop
+        if: steps.tag.outputs.exists == 'false'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          # The release commit and the next beta bump both edit manifest.json.
+          # Merging that commit into develop now makes the next develop -> main
+          # merge a one-sided version change, so Git does not report a conflict.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin develop
+          git checkout -B develop origin/develop
+          if git merge --no-edit main; then
+            git push origin HEAD:develop
+            exit 0
+          fi
+          conflicted="$(git diff --name-only --diff-filter=U)"
+          if [ "$conflicted" != "custom_components/ecovacs_goat_g1/manifest.json" ]; then
+            echo "Back-merge into develop has conflicts beyond the version line:"
+            echo "$conflicted"
+            exit 1
+          fi
+          git checkout --theirs custom_components/ecovacs_goat_g1/manifest.json
+          git add custom_components/ecovacs_goat_g1/manifest.json
+          git commit -m "Sync stable ${VERSION} from main [skip ci]"
+          git push origin HEAD:develop
