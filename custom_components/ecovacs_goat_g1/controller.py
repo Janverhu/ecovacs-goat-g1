@@ -210,10 +210,7 @@ class EcovacsController:
                 "Removing ECOVACS device no longer on the account: %s",
                 ", ".join(sorted(dids - bound)),
             )
-            device_registry.async_update_device(
-                device_entry.id,
-                remove_config_entry_id=self._entry.entry_id,
-            )
+            device_registry.async_remove_device(device_entry.id)
 
     async def _stop_coordinators(
         self, coordinators: list[MowerCoordinator]
