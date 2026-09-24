@@ -9,6 +9,7 @@
       "invalid_auth": "Invalid authentication",
       "invalid_verification_code": "The verification code is invalid or has expired.",
       "unknown": "Unexpected error",
+      "no_mower": "No GOAT mower was found on this ECOVACS account.",
       "invalid_name": "Enter a name."
     },
     "step": {

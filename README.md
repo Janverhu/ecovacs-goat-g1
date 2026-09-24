@@ -39,6 +39,8 @@ If you own an O-series mower and want fuller support (especially the area outlin
 
 This project is separate from Home Assistant's regular ECOVACS integration. It was created because the regular Ecovacs/Home Assistant path is built around a broader vacuum-oriented command stack, while this project only targets GOAT mowers and uses behavior observed from the official ECOVACS app.
 
+Current GOAT models, including the G1 line, O-series, and A-series, do not speak Matter. The built-in Matter integration cannot replace this one.
+
 The goal is to keep communication with the mower conservative: use pushed updates where possible, refresh state only when needed, and avoid broad background polling.
 
 ## Features

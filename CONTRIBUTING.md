@@ -47,13 +47,16 @@ The base is set once when a new line begins and then advances automatically.
 3. Otherwise the version is written back into `manifest.json` on `main`
    (committed as `Release <version> [skip ci]`) so Home Assistant reports the
    correct installed version, and a stable GitHub release is published.
+4. That release commit is merged back into `develop`. The next beta bump then
+   starts from the shipped version, so the following `develop` → `main` merge
+   does not conflict on `manifest.json`.
 
 ### End-to-end example
 
 | Step | Action | Result |
 | --- | --- | --- |
 | 1 | Push to `develop` (manifest `0.3.0b1`) | beta `0.3.0b1`, `0.3.0b2`, … |
-| 2 | Merge `develop` → `main` | stable **`0.3.0`**; `main` manifest synced to `0.3.0` |
+| 2 | Merge `develop` → `main` | stable **`0.3.0`**; `main` manifest synced to `0.3.0`, then merged back into `develop` |
 | 3 | Push to `develop` again | line advances → beta **`0.4.0b1`**; `develop` manifest synced to `0.4.0b1` |
 | 4 | Merge `develop` → `main` | stable **`0.4.0`** |
 
@@ -87,4 +90,4 @@ pre-commit install
 pre-commit run --all-files
 ```
 
-To skip a hook once (e.g. Docker not running): `SKIP=gitleaks-docker,semgrep-docker,trivyfs-docker git commit -m "..."` (comma-separated hook ids).
+`require-docker` runs first and rejects the commit when Docker is not running. Start Docker Desktop and commit again.
