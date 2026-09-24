@@ -12,6 +12,7 @@ The repository defines [pre-commit](https://pre-commit.com) hooks in `.pre-commi
 
 | Hook | Role |
 |------|------|
+| **require-docker** | Rejects the commit when the Docker daemon is not running, before the scanner hooks start. |
 | **gitleaks-docker** | Scans staged changes for hardcoded secrets. |
 | **semgrep-docker** | Runs Semgrep with `--config auto` (broad static checks). |
 | **pip-audit** | Audits the dependency tree in `requirements-audit.txt` for published Python CVEs (similar in spirit to `npm audit`; this project has no `package.json`). |

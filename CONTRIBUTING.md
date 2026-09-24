@@ -87,4 +87,4 @@ pre-commit install
 pre-commit run --all-files
 ```
 
-To skip a hook once (e.g. Docker not running): `SKIP=gitleaks-docker,semgrep-docker,trivyfs-docker git commit -m "..."` (comma-separated hook ids).
+`require-docker` runs first and rejects the commit when Docker is not running. Start Docker Desktop and commit again.

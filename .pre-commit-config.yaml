@@ -5,11 +5,22 @@
 # Tooling: gitleaks-docker (secrets), semgrep-docker (SAST), trivyfs-docker (vulns),
 # pip-audit (Python CVEs; closest analogue here to npm audit — there is no package.json).
 # Docker is required for the three *-docker hooks (Semgrep has no Windows wheel).
+# require-docker runs first and fail_fast stops the commit when the daemon is down.
 
 default_install_hook_types: [pre-commit]
 default_stages: [pre-commit]
+fail_fast: true
 
 repos:
+  - repo: local
+    hooks:
+      - id: require-docker
+        name: Require Docker daemon
+        entry: python scripts/require_docker.py
+        language: system
+        pass_filenames: false
+        always_run: true
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
