@@ -65,18 +65,28 @@ def test_global_only_device_is_dropped() -> None:
     assert [device["did"] for device in merged] == ["mower-1"]
 
 
-def test_bound_deebot_is_kept() -> None:
-    """Product filtering is a later change; a bound vacuum still stays."""
+def test_bound_deebot_is_skipped() -> None:
+    """A bound vacuum is not a GOAT mower."""
     merged = merge_bound_devices(
-        [_bound("mower-1"), _bound("vacuum-1", nick="Hall")],
+        [_bound("mower-1"), _bound("vacuum-1", nick="goat")],
         [
             _global("mower-1", device_name="GOAT G1-800", category="GOATBOT"),
             _global("vacuum-1", device_name="DEEBOT X2", category="DEEBOT"),
         ],
     )
 
-    assert [device["did"] for device in merged] == ["mower-1", "vacuum-1"]
-    assert merged[1]["deviceName"] == "DEEBOT X2"
+    assert [device["did"] for device in merged] == ["mower-1"]
+
+
+def test_goat_name_without_category_is_kept() -> None:
+    """A GOAT product name is enough when the category field is missing."""
+    bound = _bound("mower-1", nick="Yard")
+    global_device = _global("mower-1", device_name="GOAT O800 RTK", category="GOATBOT")
+    del global_device["product_category"]
+
+    merged = merge_bound_devices([bound], [global_device])
+
+    assert [device["did"] for device in merged] == ["mower-1"]
 
 
 def test_legacy_company_is_skipped() -> None:

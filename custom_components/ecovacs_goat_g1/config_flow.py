@@ -90,7 +90,7 @@ async def _login_and_list_devices(api: EcovacsMowerApi) -> dict[str, str]:
         errors["base"] = "unknown"
     else:
         if not devices:
-            errors["base"] = "unknown"
+            errors["base"] = "no_mower"
     return errors
 
 
@@ -250,7 +250,7 @@ class EcovacsConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "unknown"
             else:
                 if not devices:
-                    errors["base"] = "unknown"
+                    errors["base"] = "no_mower"
                 else:
                     return await self._finish_flow()
 

@@ -155,9 +155,10 @@ def merge_bound_devices(
     device_list: list[dict[str, Any]],
     global_device_list: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Keep GetDeviceList robots and copy GetGlobalDeviceList metadata onto them.
+    """Keep bound GOAT mowers and copy GetGlobalDeviceList metadata onto them.
 
     A robot that remains only in the global list is no longer bound to the account.
+    Vacuums and other non-GOAT robots are left out.
     """
     global_by_did = {
         device["did"]: device
@@ -169,9 +170,29 @@ def merge_bound_devices(
         if not isinstance(device, dict) or not device.get("did"):
             continue
         enriched = {**global_by_did.get(device["did"], {}), **device}
-        if enriched.get("company") == "eco-ng":
+        if enriched.get("company") != "eco-ng":
+            continue
+        if _is_goat_mower(enriched):
             merged.append(enriched)
+            continue
+        _LOGGER.info(
+            "Skipping non-GOAT ECOVACS device %s",
+            enriched.get("deviceName") or enriched.get("class"),
+        )
     return merged
+
+
+def _is_goat_mower(device: dict[str, Any]) -> bool:
+    """Return whether a bound eco-ng device is a GOAT mower.
+
+    ``product_category`` is the account product type. ``deviceName`` is only
+    used when that field is missing. The user nickname is ignored.
+    """
+    category = device.get("product_category")
+    if isinstance(category, str) and category.strip():
+        return category.strip().upper() == "GOATBOT"
+    device_name = device.get("deviceName")
+    return isinstance(device_name, str) and "GOAT" in device_name.upper()
 
 
 def _device_entries(response: Any) -> list[dict[str, Any]]:
@@ -352,7 +373,7 @@ class EcovacsMowerApi:
         return _parse_account_session(response, "checkLogin")
 
     async def get_devices(self) -> list[MowerDevice]:
-        """Return eco-ng devices currently bound to the account."""
+        """Return GOAT mowers currently bound to the account."""
         user_id = (await self.authenticate()).user_id
         device_list = await self._post_authenticated(
             PATH_API_USERS_USER,
