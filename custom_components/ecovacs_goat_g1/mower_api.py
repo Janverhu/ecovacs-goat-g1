@@ -151,6 +151,39 @@ class SstToken:
     expires_at: float
 
 
+def merge_bound_devices(
+    device_list: list[dict[str, Any]],
+    global_device_list: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep GetDeviceList robots and copy GetGlobalDeviceList metadata onto them.
+
+    A robot that remains only in the global list is no longer bound to the account.
+    """
+    global_by_did = {
+        device["did"]: device
+        for device in global_device_list
+        if isinstance(device, dict) and device.get("did")
+    }
+    merged: list[dict[str, Any]] = []
+    for device in device_list:
+        if not isinstance(device, dict) or not device.get("did"):
+            continue
+        enriched = {**global_by_did.get(device["did"], {}), **device}
+        if enriched.get("company") == "eco-ng":
+            merged.append(enriched)
+    return merged
+
+
+def _device_entries(response: Any) -> list[dict[str, Any]]:
+    """Return the device array from a device-list response."""
+    if not isinstance(response, dict):
+        return []
+    devices = response.get("devices", [])
+    if not isinstance(devices, list):
+        return []
+    return devices
+
+
 class EcovacsMowerApi:
     """Small ECOVACS API client for app-captured mower calls."""
 
@@ -319,23 +352,22 @@ class EcovacsMowerApi:
         return _parse_account_session(response, "checkLogin")
 
     async def get_devices(self) -> list[MowerDevice]:
-        """Return mower-like eco-ng devices from the account."""
-        devices: dict[str, dict[str, Any]] = {}
-        for path, todo in (
-            (PATH_API_USERS_USER, "GetDeviceList"),
-            (PATH_API_APPSVR_APP, "GetGlobalDeviceList"),
-        ):
-            response = await self._post_authenticated(
-                path,
-                {"userid": (await self.authenticate()).user_id, "todo": todo},
-            )
-            for device in response.get("devices", []):
-                devices[device["did"]] = device
-
+        """Return eco-ng devices currently bound to the account."""
+        user_id = (await self.authenticate()).user_id
+        device_list = await self._post_authenticated(
+            PATH_API_USERS_USER,
+            {"userid": user_id, "todo": "GetDeviceList"},
+        )
+        global_device_list = await self._post_authenticated(
+            PATH_API_APPSVR_APP,
+            {"userid": user_id, "todo": "GetGlobalDeviceList"},
+        )
         return [
             MowerDevice.from_api(device)
-            for device in devices.values()
-            if device.get("company") == "eco-ng"
+            for device in merge_bound_devices(
+                _device_entries(device_list),
+                _device_entries(global_device_list),
+            )
         ]
 
     async def control(

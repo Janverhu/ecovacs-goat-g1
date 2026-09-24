@@ -11,7 +11,11 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_ENTITY_ID, CONF_DEVICE_ID, Platform
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import config_validation as cv, entity_registry as er
+from homeassistant.helpers import (
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+)
 
 from .const import (
     CONF_SESSION_STORE_ID,
@@ -120,6 +124,18 @@ async def async_unload_entry(hass: HomeAssistant, entry: EcovacsConfigEntry) -> 
     if unload_ok:
         await entry.runtime_data.teardown()
     return unload_ok
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,
+    config_entry: EcovacsConfigEntry,
+    device_entry: dr.DeviceEntry,
+) -> bool:
+    """Allow deleting one robot from the integration entry.
+
+    The next reload recreates it when that robot is still bound to the account.
+    """
+    return True
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: EcovacsConfigEntry) -> None:

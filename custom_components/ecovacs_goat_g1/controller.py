@@ -19,7 +19,7 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-from homeassistant.helpers import aiohttp_client
+from homeassistant.helpers import aiohttp_client, device_registry as dr
 
 from .const import (
     CONF_ACCESS_TOKEN,
@@ -28,6 +28,7 @@ from .const import (
     DEFAULT_DEBUG_CAPTURE_MAX_DURATION_MINUTES,
     DEFAULT_DEBUG_CAPTURE_MAX_SIZE_MB,
     DEFAULT_DEBUG_CAPTURE_RAW_PAYLOADS,
+    DOMAIN,
     OPTION_DEBUG_CAPTURE_MAX_DURATION_MINUTES,
     OPTION_DEBUG_CAPTURE_MAX_SIZE_MB,
     OPTION_DEBUG_CAPTURE_RAW_PAYLOADS,
@@ -40,6 +41,7 @@ from .mower_api import (
     EcovacsMowerApi,
 )
 from .mower_coordinator import MowerCoordinator
+from .mower_models import MowerDevice
 from .session_store import AccountSessionStore
 from .util import get_client_device_id, get_session_store_id
 
@@ -108,6 +110,7 @@ class EcovacsController:
             self._api = api
             await api.authenticate()
             devices = await api.get_devices()
+            self._remove_unbound_devices(devices)
             if not devices:
                 raise ConfigEntryNotReady("No ECOVACS mower devices found")
 
@@ -188,6 +191,29 @@ class EcovacsController:
         if new_data != dict(self._entry.data):
             self._hass.config_entries.async_update_entry(self._entry, data=new_data)
             self._config = new_data
+
+    def _remove_unbound_devices(self, devices: list[MowerDevice]) -> None:
+        """Drop registry devices whose robot is no longer bound to the account."""
+        device_registry = dr.async_get(self._hass)
+        bound = {device.did for device in devices}
+        for device_entry in dr.async_entries_for_config_entry(
+            device_registry, self._entry.entry_id
+        ):
+            dids = {
+                identifier[1]
+                for identifier in device_entry.identifiers
+                if identifier[0] == DOMAIN
+            }
+            if not dids or dids <= bound:
+                continue
+            _LOGGER.info(
+                "Removing ECOVACS device no longer on the account: %s",
+                ", ".join(sorted(dids - bound)),
+            )
+            device_registry.async_update_device(
+                device_entry.id,
+                remove_config_entry_id=self._entry.entry_id,
+            )
 
     async def _stop_coordinators(
         self, coordinators: list[MowerCoordinator]
