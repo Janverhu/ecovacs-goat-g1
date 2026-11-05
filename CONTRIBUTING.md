@@ -37,7 +37,7 @@ The base is set once when a new line begins and then advances automatically.
    shadows a released version.
 3. The beta number increments from existing tags: `0.4.0b1`, `0.4.0b2`, …
 4. When the line advances, the new version is written back into `manifest.json`
-   on `develop` (committed as `Start <version> development line [skip ci]`).
+   on `develop` (committed as `Start <version> development line`).
 5. The beta is published as a GitHub pre-release; **older pre-releases are
    deleted** so only the latest beta is visible in HACS.
 
@@ -47,7 +47,7 @@ The base is set once when a new line begins and then advances automatically.
    (`0.3.0b1` → `0.3.0`).
 2. If that tag already exists, the run is a **no-op** (no duplicate releases).
 3. Otherwise the version is written back into `manifest.json` on `main`
-   (committed as `Release <version> [skip ci]`) so Home Assistant reports the
+   (committed as `Release <version>`) so Home Assistant reports the
    correct installed version, and a stable GitHub release is published.
 4. That release commit is merged back into `develop`. The next beta bump then
    starts from the shipped version, so the following `develop` → `main` merge
@@ -68,9 +68,17 @@ from there.
 
 ### Notes
 
+- Merge `develop` → `main` with **Create a merge commit**, not squash. A squash
+  commit copies every `develop` commit message into `main`, and one containing
+  `[skip ci]`, `[ci skip]`, `[no ci]`, `[skip actions]` or `[actions skip]`
+  makes GitHub skip `release.yml` for that push, so no release is published.
+- If a push to `main` did not publish a release, run **Release** manually from
+  the Actions tab on `main` (`gh workflow run release.yml --ref main`). It is a
+  no-op when the version is already tagged.
 - Workflow pushes use the default `GITHUB_TOKEN`, which does **not** re-trigger
-  workflows; `[skip ci]` is an additional safeguard. Both `develop` and `main`
-  must allow the token to push (branch protection bypass) for the write-backs.
+  workflows, so the bot commits carry no `[skip ci]` marker. Both `develop` and
+  `main` must allow the token to push (branch protection bypass) for the
+  write-backs.
 - Both publishing workflows run the reusable `tests.yml` first. A failing test
   stops the beta or the release.
 - The dashboard card is cache-busted by a content hash of the card file (see

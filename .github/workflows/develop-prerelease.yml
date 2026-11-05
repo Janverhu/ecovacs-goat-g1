@@ -76,8 +76,10 @@ jobs:
               git config user.name "github-actions[bot]"
               git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
               git add custom_components/ecovacs_goat_g1/manifest.json
-              # [skip ci] avoids re-triggering this workflow on the push to develop.
-              git commit -m "Start ${VERSION} development line [skip ci]"
+              # No [skip ci]: this message reaches main in a squash merge and
+              # would skip release.yml there. GITHUB_TOKEN pushes do not
+              # re-trigger workflows anyway.
+              git commit -m "Start ${VERSION} development line"
               git push origin HEAD:develop
             fi
           fi

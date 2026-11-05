@@ -8,10 +8,17 @@ name: Release
 # (e.g. to 0.4.0b1). The computed version is written back into manifest.json and
 # committed to main so Home Assistant reports the correct installed version.
 # Development betas are handled separately by develop-prerelease.yml.
+#
+# The bot commits below must never contain a skip marker such as [skip ci]: a
+# squash merge of develop copies every commit message into the commit on main,
+# and GitHub then skips this workflow for that push. The markers are not needed,
+# because pushes made with GITHUB_TOKEN do not trigger workflows. If a push to
+# main still does not produce a release, run this workflow manually on main.
 
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -30,6 +37,8 @@ jobs:
   release:
     name: Publish stable release
     needs: tests
+    # A manual run from another branch would push that branch's HEAD to main.
+    if: github.ref == 'refs/heads/main'
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -78,8 +87,7 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add custom_components/ecovacs_goat_g1/manifest.json
-            # [skip ci] avoids re-triggering this workflow on the push back to main.
-            git commit -m "Release ${VERSION} [skip ci]"
+            git commit -m "Release ${VERSION}"
             git push origin HEAD:main
           fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -117,5 +125,5 @@ jobs:
           fi
           git checkout --theirs custom_components/ecovacs_goat_g1/manifest.json
           git add custom_components/ecovacs_goat_g1/manifest.json
-          git commit -m "Sync stable ${VERSION} from main [skip ci]"
+          git commit -m "Sync stable ${VERSION} from main"
           git push origin HEAD:develop
