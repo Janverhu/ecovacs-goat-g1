@@ -678,7 +678,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
     def _merge_trace_reply(self, response: dict[str, Any]) -> bool:
         """Merge a getMapTrace_V2 reply and return whether the trace advanced."""
         previous_state = self.data
-        state = apply_response(previous_state, "getMapTrace_V2", response)
+        state = apply_response(self.data, "getMapTrace_V2", response)
         trace_changed = self._trace_path_changed(previous_state, state)
         if trace_changed:
             state = self._reset_live_position_segment(state)

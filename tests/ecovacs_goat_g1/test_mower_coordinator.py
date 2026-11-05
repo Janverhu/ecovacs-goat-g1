@@ -125,6 +125,9 @@ from custom_components.ecovacs_goat_g1.mower_models import (  # noqa: E402
 MID = "1813510333"
 TRACE = [(100, 200), (300, 200), (300, 400), (100, 400)]
 LAWN = [(0, 0), (900, 0), (900, 900), (0, 900)]
+# O-series lawn: start point plus a 50-unit direction chain.
+RTK_LAWN_CHAIN = "4(18)6(18)8(18)2(18)"
+RTK_LAWN = [(0, 0), (900, 0), (900, -900), (0, -900), (0, 0)]
 GET_POS_REPLY = {
     "body": {
         "data": {
@@ -174,6 +177,18 @@ def _lawn_pushes(batch: str, points: list[tuple[int, int]]) -> list[tuple[str, d
     return [
         (
             "onMapInfo_V2",
+            {"mid": MID, "batid": batch, "serial": len(pieces), "type": "0",
+             "using": 1, "index": index, "info": info},
+        )
+        for index, info in enumerate(pieces)
+    ]
+
+
+def _rtk_lawn_pushes(batch: str, chain: str) -> list[tuple[str, dict]]:
+    pieces = _info_pieces([["1", f"s1;1;0,0;{chain}"], ["2", "1"]])
+    return [
+        (
+            "onMI",
             {"mid": MID, "batid": batch, "serial": len(pieces), "type": "0",
              "using": 1, "index": index, "info": info},
         )
@@ -241,10 +256,12 @@ def _restored_state() -> MowerState:
     )
 
 
-def _coordinator(api: FakeApi, state: MowerState) -> MowerCoordinator:
+def _coordinator(
+    api: FakeApi, state: MowerState, model: str = "GOAT G1-800"
+) -> MowerCoordinator:
     device = MowerDevice(
         did="did", device_class="class", resource="resource", name="GOAT",
-        model="GOAT G1-800",
+        model=model,
     )
     coordinator = MowerCoordinator(
         FakeHass(asyncio.get_running_loop()), api, device, object()
@@ -328,4 +345,22 @@ async def test_readback_keeps_lawn_pieces_pushed_during_its_trace_request() -> N
     assert api.commands.index("getMapInfo_V2") < api.commands.index("getMapTrace_V2")
     assert _points(coordinator.data.map.info.outline) == LAWN
     assert _points(coordinator.data.map.trace.path) == TRACE
+    await coordinator.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_o_series_readback_keeps_lawn_pieces_pushed_during_later_requests() -> None:
+    """The O-series lawn follows getMI while the map-set reads are still pending."""
+    api = FakeApi()
+    api.pushes["getMapTrack"] = _rtk_lawn_pushes("lawn", RTK_LAWN_CHAIN)
+    coordinator = _coordinator(
+        api, MowerState(map=MowerMap(mid=MID)), model="GOAT O800 RTK"
+    )
+    coordinator._device_mqtt_ready = True
+
+    await coordinator.async_refresh_state()
+
+    assert api.commands.index("getMI") < api.commands.index("getMapTrack")
+    assert "getMapTrace_V2" not in api.commands
+    assert _points(coordinator.data.map.info.outline) == RTK_LAWN
     await coordinator.async_stop()

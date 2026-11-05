@@ -1,6 +1,6 @@
 name: Release
 
-# Publishes a stable GitHub release when main is updated. The stable version is
+# Publishes a stable GitHub release when main is updated and the tests pass. The stable version is
 # the manifest's base version with any pre-release suffix stripped
 # (e.g. 0.3.0b1 -> stable 0.3.0), so merging the current beta line into main
 # promotes it to a release. If that version was already released the run is a
@@ -21,8 +21,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  tests:
+    name: Tests
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests.yml
+
   release:
     name: Publish stable release
+    needs: tests
     permissions:
       contents: write
     runs-on: ubuntu-latest
