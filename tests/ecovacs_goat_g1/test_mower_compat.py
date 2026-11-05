@@ -17,7 +17,7 @@ ecovacs_goat_g1 = types.ModuleType("custom_components.ecovacs_goat_g1")
 ecovacs_goat_g1.__path__ = [str(PACKAGE_PATH)]
 sys.modules.setdefault("custom_components.ecovacs_goat_g1", ecovacs_goat_g1)
 
-from custom_components.ecovacs_goat_g1.mower_api import EcovacsApiError
+from custom_components.ecovacs_goat_g1.mower_api import EcovacsApiError, EcovacsAuthError
 from custom_components.ecovacs_goat_g1.mower_compat import (
     GETINFO_UNSUPPORTED_FAILURE_THRESHOLD,
     ProtocolProfile,
@@ -124,6 +124,36 @@ async def test_resilient_getinfo_uses_clean_info_fallback_after_v2_disabled() ->
 
 
 @pytest.mark.asyncio
+async def test_getinfo_login_failure_is_not_retried_per_command() -> None:
+    """A login failure must not fan out into one getInfo call per command."""
+    api = AsyncMock()
+    api.control = AsyncMock(side_effect=EcovacsAuthError("invalid credentials"))
+
+    with pytest.raises(EcovacsAuthError):
+        await apply_resilient_getinfo_group(
+            api,
+            object(),
+            MowerState(),
+            ("getBattery", "getError", "getStats"),
+            ProtocolProfile(),
+        )
+
+    assert api.control.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_live_position_does_not_retry_login_failure() -> None:
+    """A login failure must not be followed by a second getPos."""
+    api = AsyncMock()
+    api.control = AsyncMock(side_effect=EcovacsAuthError("invalid credentials"))
+
+    with pytest.raises(EcovacsAuthError):
+        await refresh_live_position(api, object(), MowerState(), ProtocolProfile())
+
+    assert api.control.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_refresh_live_position_drops_uwb_on_error() -> None:
     """If getPos with uwbPos fails, retry without UWB and persist the narrower field set."""
     api = AsyncMock()
@@ -193,6 +223,34 @@ async def test_refresh_rtk_map_fetches_layers_and_decodes() -> None:
         "aid": "0",
         "type": "ar",
     }
+
+
+@pytest.mark.asyncio
+async def test_refresh_rtk_map_requests_outline_when_asked() -> None:
+    """getMI is sent with the given body, and only when an outline is wanted."""
+    api = AsyncMock()
+    device = object()
+    events: list[tuple[str, dict]] = []
+    api.control.return_value = {"body": {"data": {}}}
+
+    await refresh_rtk_map(
+        api,
+        device,
+        MowerState(map=MowerMap(mid="1")),
+        capture=lambda event, data: events.append((event, data)),
+        outline_body={"type": "0"},
+    )
+
+    commands = [call.args[1] for call in api.control.call_args_list]
+    assert commands == ["getMapState", "getRTK", "getMI", "getMapTrack", "getAreaSet"]
+    assert api.control.call_args_list[2].args[2] == {"type": "0"}
+    assert events == [("rtk_outline_requested", {"body": {"type": "0"}})]
+
+    api.control.reset_mock()
+    await refresh_rtk_map(api, device, MowerState(map=MowerMap(mid="1")))
+
+    commands = [call.args[1] for call in api.control.call_args_list]
+    assert "getMI" not in commands
 
 
 @pytest.mark.asyncio

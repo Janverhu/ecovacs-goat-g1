@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, replace
 import logging
 from typing import TYPE_CHECKING, Any
 
-from .mower_api import EcovacsApiError
+from .mower_api import EcovacsApiError, EcovacsAuthError
 from .mower_messages import apply_response
 from .mower_models import MowerState
 
@@ -28,6 +28,9 @@ _LOGGER = logging.getLogger(__name__)
 # When a mower rejects getCleanInfo_V2, try legacy clean info (same apply_command_data path).
 GETINFO_CLEAN_FALLBACKS: dict[str, str] = {"getCleanInfo_V2": "getCleanInfo"}
 GETINFO_UNSUPPORTED_FAILURE_THRESHOLD = 3
+# The getMI request body is not captured yet. onMI replies carry type "0",
+# which is also the G1 getMapInfo_V2 body, so that is tried first.
+RTK_OUTLINE_REQUEST_BODIES: tuple[dict[str, Any], ...] = ({"type": "0"}, {})
 
 
 def control_command_unsupported(err: BaseException) -> bool:
@@ -82,6 +85,8 @@ async def apply_resilient_getinfo_group(
             profile, getinfo_failures=failures
         )
     except EcovacsApiError as err:
+        if isinstance(err, EcovacsAuthError):
+            raise
         _LOGGER.debug(
             "ECOVACS grouped getInfo failed (%s); retrying %s per-command",
             err,
@@ -98,7 +103,9 @@ async def apply_resilient_getinfo_group(
             response = await api.control(device, "getInfo", [cmd])
             new_state = apply_response(new_state, "getInfo", response)
             failures.pop(cmd, None)
-        except EcovacsApiError:
+        except EcovacsApiError as err:
+            if isinstance(err, EcovacsAuthError):
+                raise
             _record_getinfo_failure(cmd, failures, unsupported)
             alt = GETINFO_CLEAN_FALLBACKS.get(cmd)
             if alt and alt not in unsupported:
@@ -106,7 +113,9 @@ async def apply_resilient_getinfo_group(
                     response = await api.control(device, "getInfo", [alt])
                     new_state = apply_response(new_state, "getInfo", response)
                     failures.pop(alt, None)
-                except EcovacsApiError:
+                except EcovacsApiError as alt_err:
+                    if isinstance(alt_err, EcovacsAuthError):
+                        raise
                     _record_getinfo_failure(alt, failures, unsupported)
                     _LOGGER.debug(
                         "ECOVACS getInfo %s and fallback %s are not supported",
@@ -167,6 +176,8 @@ async def refresh_live_position(
         response = await api.control(device, "getPos", fields)
         return apply_response(state, "getPos", response), profile
     except EcovacsApiError as err:
+        if isinstance(err, EcovacsAuthError):
+            raise
         if "uwbPos" in fields:
             _LOGGER.debug(
                 "ECOVACS getPos with uwbPos failed (%s); retrying without UWB fields",
@@ -187,18 +198,25 @@ async def refresh_rtk_map(
     state: MowerState,
     *,
     capture: Callable[[str, dict[str, Any]], None] | None = None,
+    outline_body: dict[str, Any] | None = None,
 ) -> MowerState:
     """Best-effort O-series (RTK) map refresh.
 
     Reads map build state, the fixed RTK base station, and the virtual-wall
     (``getMapTrack``) / area (``getAreaSet``) map-set layers, whose ``subsets``
     blobs decode with the shared LZMA decoder. Each call degrades gracefully on
-    failure. The base-map outline itself is pushed over MQTT, not returned here,
-    so it is not part of this poll. ``getAreaSet`` reuses the active map id that
-    the live position stream (``getPos``) already learned.
+    failure. ``getAreaSet`` reuses the active map id that the live position
+    stream (``getPos``) already learned.
+
+    The lawn outline arrives afterwards as ``onMI`` pushes. ``getMI`` is sent
+    with ``outline_body`` only when the caller still needs the outline.
     """
     for command, payload in (("getMapState", {}), ("getRTK", {})):
         state = await _rtk_map_call(api, device, state, command, payload, capture)
+    if outline_body is not None:
+        if capture is not None:
+            capture("rtk_outline_requested", {"body": outline_body})
+        state = await _rtk_map_call(api, device, state, "getMI", outline_body, capture)
 
     mid = state.map.mid or "0"
     for command, payload in (
@@ -222,6 +240,8 @@ async def _rtk_map_call(
         response = await api.control(device, command, payload)
         return apply_response(state, command, response)
     except EcovacsApiError as err:
+        if isinstance(err, EcovacsAuthError):
+            raise
         _LOGGER.debug("ECOVACS O-series %s failed: %s", command, err)
         if capture is not None:
             capture(

@@ -179,7 +179,7 @@ async def test_authenticate_rotates_stored_session_via_check_login() -> None:
 
 @pytest.mark.asyncio
 async def test_authenticate_keeps_session_on_transient_check_login_error() -> None:
-    """A non-auth checkLogin failure must not discard the private session."""
+    """A non-credential checkLogin failure must not be retried or password-login."""
     persisted = AsyncMock()
     existing = AccountSession(user_id="uid-long", access_token="access-1")
     api = _api(
@@ -189,21 +189,94 @@ async def test_authenticate_keeps_session_on_transient_check_login_error() -> No
     api._check_login = AsyncMock(side_effect=EcovacsAuthError("auth call failed"))
     api._login_password = AsyncMock(side_effect=AssertionError("password login"))
 
+    api._sst_token = AsyncMock(side_effect=AssertionError("mower command"))
+
     with pytest.raises(EcovacsAuthError, match="auth call failed"):
+        await api.authenticate()
+    with pytest.raises(EcovacsAuthError, match="reauthentication required"):
+        await api.authenticate()
+    with pytest.raises(EcovacsAuthError, match="reauthentication required"):
+        await api.control(MagicMock(), "appping", {})
+
+    api._login_password.assert_not_called()
+    api._sst_token.assert_not_called()
+    assert api._check_login.await_count == 1
+    persisted.assert_not_called()
+    assert api.account_session == existing
+    assert api.reauth_required
+
+
+@pytest.mark.asyncio
+async def test_unattended_login_failure_does_not_retry() -> None:
+    """A rejected stored session must not password-login or try checkLogin again."""
+    existing = AccountSession(user_id="uid-long", access_token="access-1")
+    api = _api(account_session=existing)
+    api._check_login = AsyncMock(side_effect=EcovacsAuthError("invalid credentials"))
+    api._login_password = AsyncMock(side_effect=AssertionError("password login"))
+    api._sst_token = AsyncMock(side_effect=AssertionError("mower command"))
+
+    with pytest.raises(EcovacsAuthError, match="invalid credentials"):
+        await api.authenticate()
+    with pytest.raises(EcovacsAuthError, match="reauthentication required"):
+        await api.authenticate()
+    with pytest.raises(EcovacsAuthError, match="reauthentication required"):
+        await api.control(MagicMock(), "getInfo", ["getBattery"])
+
+    api._login_password.assert_not_called()
+    api._sst_token.assert_not_called()
+    assert api._check_login.await_count == 1
+    assert api.account_session == existing
+    assert api.reauth_required
+
+
+@pytest.mark.asyncio
+async def test_missing_session_does_not_password_login() -> None:
+    """Startup without a stored session must ask for a sign-in, not log in itself."""
+    api = _api()
+    api._login_password = AsyncMock(side_effect=AssertionError("password login"))
+
+    with pytest.raises(EcovacsAuthError, match="reauthentication required"):
+        await api.authenticate()
+    with pytest.raises(EcovacsAuthError, match="reauthentication required"):
         await api.authenticate()
 
     api._login_password.assert_not_called()
-    persisted.assert_not_called()
-    assert api.account_session == existing
+    assert api.reauth_required
+
+
+@pytest.mark.asyncio
+async def test_reauth_form_password_login_after_other_check_login_error() -> None:
+    """The reauth form must not get stuck on a stored session checkLogin rejects."""
+    api = _api(
+        account_session=AccountSession(user_id="uid-long", access_token="access-1"),
+        allow_password_login=True,
+    )
+    api._check_login = AsyncMock(side_effect=EcovacsAuthError("auth call failed"))
+    api._login_password = AsyncMock(
+        return_value={"uid": "uid-long", "accessToken": "access-2"}
+    )
+    api._complete_login = AsyncMock(
+        return_value=Credentials(
+            user_id="uid-short", token="portal-token", expires_at=9_999_999_999
+        )
+    )
+
+    credentials = await api.authenticate()
+
+    api._login_password.assert_awaited_once()
+    assert credentials.token == "portal-token"
+    assert api.account_session == AccountSession("uid-long", "access-2")
+    assert not api.reauth_required
 
 
 @pytest.mark.asyncio
 async def test_authenticate_clears_session_on_definitive_auth_failure() -> None:
-    """Expired credentials must drop the private session before password login."""
+    """A user-submitted login drops a dead session, then uses the password."""
     persisted = AsyncMock()
     api = _api(
         account_session=AccountSession(user_id="uid-long", access_token="access-1"),
         account_session_update_callback=persisted,
+        allow_password_login=True,
     )
     api._check_login = AsyncMock(side_effect=EcovacsAuthError("invalid credentials"))
     api._login_password = AsyncMock(side_effect=DeviceVerificationRequiredError("1013"))

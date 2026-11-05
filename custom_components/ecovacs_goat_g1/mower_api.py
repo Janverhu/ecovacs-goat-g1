@@ -219,6 +219,7 @@ class EcovacsMowerApi:
         debug_capture: DebugCaptureStore | None = None,
         account_session: AccountSession | None = None,
         account_session_update_callback: AccountSessionUpdateCallback | None = None,
+        allow_password_login: bool = False,
     ) -> None:
         self._session = session
         self._username = username
@@ -229,6 +230,9 @@ class EcovacsMowerApi:
         self._credentials: Credentials | None = None
         self._account_session = account_session
         self._account_session_update_callback = account_session_update_callback
+        self._allow_password_login = allow_password_login
+        self._reauth_required = False
+        self._reauth_notified = False
         self._auth_lock = asyncio.Lock()
         self._public_key: rsa.RSAPublicKey | None = None
         self._sst: dict[str, SstToken] = {}
@@ -263,12 +267,43 @@ class EcovacsMowerApi:
         """Replace the private-session persistence sink."""
         self._account_session_update_callback = callback
 
+    @property
+    def reauth_required(self) -> bool:
+        """Return whether an unattended login failure is waiting for the user."""
+        return self._reauth_required
+
+    def mark_reauth_required(self) -> None:
+        """Remember that further unattended logins must not be attempted."""
+        self._reauth_required = True
+
+    def consume_reauth_notification(self) -> bool:
+        """Return True once, when this failure still needs a user notification."""
+        if not self._reauth_required or self._reauth_notified:
+            return False
+        self._reauth_notified = True
+        return True
+
     async def authenticate(self, *, force: bool = False) -> Credentials:
-        """Authenticate and cache ECOVACS account credentials."""
+        """Authenticate and cache ECOVACS account credentials.
+
+        Startup and background calls never fall through to a password login.
+        A failed stored session is reported once so Home Assistant can ask the
+        user to sign in, instead of retrying until the mower is disturbed.
+        The config and reauth forms fall back to the submitted password when
+        the stored session fails for any auth reason.
+        """
+        if self._reauth_blocked():
+            raise EcovacsAuthError(
+                "ECOVACS login expired; reauthentication required"
+            )
         if self._credentials_are_current(force):
             return self._credentials  # type: ignore[return-value]
 
         async with self._auth_lock:
+            if self._reauth_blocked():
+                raise EcovacsAuthError(
+                    "ECOVACS login expired; reauthentication required"
+                )
             if self._credentials_are_current(force):
                 return self._credentials  # type: ignore[return-value]
 
@@ -282,10 +317,17 @@ class EcovacsMowerApi:
                     )
                     return self._credentials
                 except EcovacsAuthError as err:
+                    if not self._allow_password_login:
+                        self._reauth_required = True
+                        raise
                     if _is_definitive_auth_failure(err):
                         await self._async_set_account_session(None)
-                    else:
-                        raise
+
+            if not self._allow_password_login:
+                self._reauth_required = True
+                raise EcovacsAuthError(
+                    "ECOVACS login expired; reauthentication required"
+                )
 
             login_resp = await self._login_password()
             account_session = _parse_account_session(login_resp, "login")
@@ -300,6 +342,10 @@ class EcovacsMowerApi:
                     await self._async_set_account_session(None)
                 raise
             return self._credentials
+
+    def _reauth_blocked(self) -> bool:
+        """Return whether unattended callers must stop before another login."""
+        return self._reauth_required and not self._allow_password_login
 
     def _credentials_are_current(self, force: bool) -> bool:
         """Return whether cached portal credentials can be reused."""
@@ -398,6 +444,10 @@ class EcovacsMowerApi:
         data: Any | None = None,
     ) -> dict[str, Any]:
         """Execute an N-GIoT app-style command against the mower."""
+        if self._reauth_required:
+            raise EcovacsAuthError(
+                "ECOVACS login expired; reauthentication required"
+            )
         if data is None:
             data = {}
         sst = await self._sst_token(device)
@@ -802,7 +852,8 @@ def _raise_for_control_error(command: str, result: Any) -> None:
     if code != 0:
         msg = body.get("msg") or body.get("message") or "unknown error"
         raise EcovacsApiError(
-            f"Control command {command} failed with code {code}: {msg}"
+            f"Control command {command} failed with code {code}: {msg}; "
+            f"body={body!r}"
         )
 
 

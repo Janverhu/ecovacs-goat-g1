@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+from collections.abc import Callable
 from dataclasses import replace
 import json
 import lzma
@@ -51,6 +52,22 @@ POSITION_HISTORY_ACTIVITIES = {
 # may switch the active map (and reset stale geometry); base-map / trace replies
 # merely contribute geometry for whichever map is already active.
 _ACTIVE_MAP_ID_COMMANDS = {"getPos", "onPos", "getUWB", "onUWB"}
+# O1200 LiDAR Pro map units are millimetres. robotPos and signal poses use
+# them, while bd_locationjump prev/curr are in metres.
+_METRES_TO_MAP = 1000
+# O-series base-map chain code: digit -> unit step, clockwise from north-west.
+# A digit followed by ``(n)`` is that step taken n times in total.
+_RTK_CHAIN_STEPS = {
+    "1": (-1, 1),
+    "2": (0, 1),
+    "3": (1, 1),
+    "4": (1, 0),
+    "5": (1, -1),
+    "6": (0, -1),
+    "7": (-1, -1),
+    "8": (-1, 0),
+}
+_RTK_CHAIN_STEP_SIZE = 50
 
 
 def decode_payload(payload: str | bytes | bytearray | dict[str, Any]) -> dict[str, Any]:
@@ -237,11 +254,21 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
                         record_history=state.activity in POSITION_HISTORY_ACTIVITIES,
                     ),
                 )
-        case "onFwBuryPoint-bd_basicinfo" | "onFwBuryPoint-bd_locationjump":
+        case (
+            "onFwBuryPoint-bd_basicinfo"
+            | "onFwBuryPoint-bd_locationjump"
+            | "onFwBuryPoint-bd_task-charge-stop"
+        ):
             # O1200 LiDAR Pro leaves getPos at the origin. The live point is
             # this telemetry string (x,y and a height/flag the map does not use).
             if isinstance(data, dict):
                 state = _apply_telemetry_position(state, data)
+        case "onFwBuryPoint-bd_sysinfo":
+            # O1200 LiDAR Pro batches Wi-Fi samples with the pose each was taken
+            # at. robotPos is rare, so these are most of the mowing path, and a
+            # sample taken on the charger places the dock.
+            if isinstance(data, dict):
+                state = _apply_signal_poses(state, data)
         case "getUWB" | "onUWB":
             if isinstance(data, dict):
                 state = replace(state, map=_map_uwb_data(state.map, data))
@@ -258,11 +285,19 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
             # decoder.
             if isinstance(data, dict):
                 state = replace(state, map=_map_set_layer(state.map, data))
+        case "getMI" | "onMI":
+            # O-series base map. The lawn arrives as onMI pieces with the same
+            # chunk fields as onMapInfo_V2, but the boundary is a chain code.
+            if isinstance(data, dict):
+                mower_map = _map_mid_only(state.map, data)
+                if "info" in data:
+                    mower_map = _map_info_data(
+                        mower_map, data, decode=_decode_rtk_base_map
+                    )
+                state = replace(state, map=mower_map)
         case (
             "getMapState"
             | "onMapState"
-            | "getMI"
-            | "onMI"
             | "getSpecialContour"
             | "onSpecialContour"
             | "getMapInfo"
@@ -514,10 +549,41 @@ def _apply_telemetry_position(state: MowerState, data: dict[str, Any]) -> MowerS
     """Apply an O1200 LiDAR telemetry point to the live marker."""
     points = [
         position
-        for key in ("prev", "robotPos", "curr")
-        if (position := _csv_position(data.get(key))) is not None
+        for key, scale in (
+            ("prev", _METRES_TO_MAP),
+            ("robotPos", 1),
+            ("curr", _METRES_TO_MAP),
+        )
+        if (position := _csv_position(data.get(key), scale=scale)) is not None
     ]
-    charger = _csv_position(data.get("chargerPos"))
+    # The LiDAR map is built from the dock, so the dock really is at 0,0.
+    charger = _csv_position(data.get("chargerPos"), allow_origin=True)
+    return _apply_telemetry_points(state, points, charger)
+
+
+def _apply_signal_poses(state: MowerState, data: dict[str, Any]) -> MowerState:
+    """Apply the poses attached to O1200 LiDAR Wi-Fi signal samples."""
+    samples = data.get("signalInfos")
+    if not isinstance(samples, list):
+        return state
+    points: list[MapPosition] = []
+    charger: MapPosition | None = None
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        if _int(sample.get("charger")) == 1:
+            charger = _csv_position(sample.get("pose"), allow_origin=True) or charger
+        elif (position := _csv_position(sample.get("pose"))) is not None:
+            points.append(position)
+    return _apply_telemetry_points(state, points, charger)
+
+
+def _apply_telemetry_points(
+    state: MowerState,
+    points: list[MapPosition],
+    charger: MapPosition | None,
+) -> MowerState:
+    """Move the marker to the last telemetry point and extend the mowing path."""
     if not points and charger is None:
         return state
 
@@ -539,11 +605,14 @@ def _apply_telemetry_position(state: MowerState, data: dict[str, Any]) -> MowerS
     )
 
 
-def _csv_position(value: Any) -> MapPosition | None:
+def _csv_position(
+    value: Any, *, scale: float = 1, allow_origin: bool = False
+) -> MapPosition | None:
     """Parse ``x,y,...`` telemetry into a map point.
 
     The first two fields are the map coordinates. Later fields are height and
-    flags. An all-zero point is the stationary placeholder and is ignored.
+    flags. An all-zero point is the stationary placeholder and is ignored
+    unless ``allow_origin`` is set.
     """
     if not isinstance(value, str) or not value.strip():
         return None
@@ -551,11 +620,11 @@ def _csv_position(value: Any) -> MapPosition | None:
     if len(parts) < 2:
         return None
     try:
-        x = int(round(float(parts[0])))
-        y = int(round(float(parts[1])))
+        x = int(round(float(parts[0]) * scale))
+        y = int(round(float(parts[1]) * scale))
     except ValueError:
         return None
-    if x == 0 and y == 0:
+    if x == 0 and y == 0 and not allow_origin:
         return None
     return MapPosition(x=x, y=y)
 
@@ -658,8 +727,18 @@ def _map_trace_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
     )
 
 
-def _map_info_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
-    """Merge chunked onMapInfo_V2 data into the base map cache."""
+def _map_info_data(
+    current: MowerMap,
+    data: dict[str, Any],
+    *,
+    decode: Callable[
+        [dict[int, str]],
+        tuple[tuple[MapPosition, ...], tuple[tuple[MapPosition, ...], ...]],
+    ]
+    | None = None,
+) -> MowerMap:
+    """Merge chunked onMapInfo_V2 / onMI data into the base map cache."""
+    decode = decode or _decode_base_map
     # The map screen keeps a piece only when using is 1. Other copies are
     # inactive and must not enter the chunk set.
     using = _int(data.get("using"))
@@ -688,7 +767,7 @@ def _map_info_data(current: MowerMap, data: dict[str, Any]) -> MowerMap:
         chunks[index] = info
 
     if _map_chunks_ready(chunks, _int(serial)):
-        decoded_outline, decoded_obstacles = _decode_base_map(chunks)
+        decoded_outline, decoded_obstacles = decode(chunks)
     else:
         decoded_outline, decoded_obstacles = (), ()
     # An incomplete follow-up chunk must not erase a lawn that already decoded.
@@ -934,6 +1013,71 @@ def _decode_base_map(
 
     outline = max(outline_candidates, key=len, default=())
     return outline, tuple(obstacles)
+
+
+def _decode_rtk_base_map(
+    chunks: dict[int, str],
+) -> tuple[tuple[MapPosition, ...], tuple[tuple[MapPosition, ...], ...]]:
+    """Decode an O-series onMI base map into the lawn outline.
+
+    Layer ``1`` holds one ``s<n>;<flag>;<x>,<y>;<chain>`` string per boundary.
+    The card draws one outline, so the largest boundary wins.
+    """
+    try:
+        payload = _decode_lzma_json_chunks(chunks)
+    except (binascii.Error, ValueError, lzma.LZMAError, json.JSONDecodeError):
+        return (), ()
+
+    if not isinstance(payload, list):
+        return (), ()
+
+    boundaries: list[tuple[MapPosition, ...]] = []
+    for item in payload:
+        if not isinstance(item, list) or len(item) < 2 or str(item[0]) != "1":
+            continue
+        for boundary in item[1:]:
+            if isinstance(boundary, str):
+                positions = _chain_boundary(boundary)
+                if len(positions) >= 3:
+                    boundaries.append(positions)
+    return max(boundaries, key=len, default=()), ()
+
+
+def _chain_boundary(value: str) -> tuple[MapPosition, ...]:
+    """Expand ``...;<x>,<y>;<chain>`` into the boundary's corner points."""
+    fields = value.split(";")
+    if len(fields) < 2:
+        return ()
+    start = fields[-2].split(",")
+    if len(start) < 2:
+        return ()
+    try:
+        x, y = int(start[0]), int(start[1])
+    except ValueError:
+        return ()
+
+    chain = fields[-1]
+    positions = [MapPosition(x=x, y=y)]
+    index = 0
+    while index < len(chain):
+        step = _RTK_CHAIN_STEPS.get(chain[index])
+        if step is None:
+            return ()
+        index += 1
+        count = 1
+        if index < len(chain) and chain[index] == "(":
+            end = chain.find(")", index)
+            if end < 0:
+                return ()
+            try:
+                count = int(chain[index + 1 : end])
+            except ValueError:
+                return ()
+            index = end + 1
+        x += step[0] * _RTK_CHAIN_STEP_SIZE * count
+        y += step[1] * _RTK_CHAIN_STEP_SIZE * count
+        positions.append(MapPosition(x=x, y=y))
+    return tuple(positions)
 
 
 def map_geometry_health(mower_map: MowerMap) -> dict[str, Any]:

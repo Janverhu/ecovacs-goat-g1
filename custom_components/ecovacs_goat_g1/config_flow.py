@@ -69,6 +69,7 @@ def _create_api(
         device_id=get_client_device_id(user_input),
         account_session=account_session,
         account_session_update_callback=_persist,
+        allow_password_login=True,
     )
 
 

@@ -31,8 +31,13 @@ mowers speak **two dialects**. The integration models this with a per-device
     (`state`, `cleanState.motionState`, `trigger`, nested `cleanState.cid`).
   - `getPos` asks for `chargePos`, `deebotPos`, and `rtkPos` (no `uwbPos`).
     On the O1200 LiDAR Pro those fields stay at the origin with no RTK fix.
-    The live point is the `robotPos` string on `onFwBuryPoint-bd_basicinfo`,
-    and `curr` on `onFwBuryPoint-bd_locationjump`.
+    Its map is in millimetres with the dock at `0,0`. Live points are the
+    `robotPos` string on `onFwBuryPoint-bd_basicinfo` (rare), the `pose` of
+    each `signalInfos` sample on `onFwBuryPoint-bd_sysinfo` (five per batch,
+    about every five minutes), and `prev` / `curr` on
+    `onFwBuryPoint-bd_locationjump`, which are in metres. A sample with
+    `charger` `1`, or `chargerPos` on `onFwBuryPoint-bd_task-charge-stop`,
+    places the dock.
   - Return to dock is `charge` with `act` `go` and leaves the Auto task open.
     Ending the task, which lets the next schedule start, is `clean` with
     `act` `stop`. A null HTTP body on `clean` is a successful fire-and-forget.
@@ -46,12 +51,19 @@ Dock (`charge {act:"go"}`), `appping`, `getLifeSpan`, battery, and error are
 shared. The capability profile picks the command names / map dialect; the runtime
 profile in `mower_compat.py` still adapts on failures.
 
-`getAreaSet` type `ar` decodes to area anchor points. The lawn outline pushed
-on `getMapTrack`, `getMI`, `onMI`, `onArI`, and `onSpecialContour` is still
-not decoded: no capture yet includes those bodies. The map id is learned so a
-later capture can complete that decode. An RTK fix uses `deebotPos` and
-`rtkPos`. A LiDAR `getPos` stuck at the origin is ignored in favor of
-`robotPos`.
+`getAreaSet` type `ar` decodes to area anchor points. The O-series lawn
+outline arrives as `onMI` pieces when the app map opens. They use the same
+`batid` / `serial` / `index` / `using` / `info` fields and base64 plus LZMA
+wrapper as `onMapInfo_V2`. Inside, layer `1` holds one
+`s<n>;<flag>;<x>,<y>;<chain>` string per boundary. The chain is a start point
+followed by 50-unit steps. Digits `1` to `8` run clockwise from north-west
+(`1` NW, `2` N, `3` NE, `4` E, `5` SE, `6` S, `7` SW, `8` W), and `d(n)` is
+direction `d` taken `n` times in total. `onArI` repeats the same boundary in
+`<id>;<x>,<y>;<chain>` pieces and is not needed for the outline. The `getMI`
+request body is not captured yet. The integration tries `{"type": "0"}` and
+`{}` in turn while the outline is missing. An RTK fix uses `deebotPos` and
+`rtkPos`. A LiDAR `getPos` stuck at the origin is ignored in favor of the
+telemetry points above.
 
 - Device commands use the N-GIoT endpoint `/api/iot/endpoint/control` with `apn=<command>` and `fmt=j`.
 - Command bodies use the app-style envelope with header version `0.0.22`.

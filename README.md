@@ -30,10 +30,11 @@ For O-series mowers the integration:
 - Detects the model and reports it on the **GOAT model line** diagnostic sensor (with `family`, `map_dialect`, and an `experimental` flag).
 - Drives the lawn mower entity, start/pause/resume/stop/dock controls, status, battery, error, and the **live position map** (mower marker + path) from the shared position stream.
 - Shows the **RTK base station** on the map (from `getRTK`) where the G1 line shows UWB beacons.
-- **Does not** yet draw the completed-area outline, because the only available O-series capture was taken while docked (the map-trace command returns `fail` with no job running), so there is no validated geometry sample to decode. The map id is still learned so this can be finished later.
+- Draws the **lawn outline** from the `onMI` map push (validated on an O1200 LiDAR Pro). Home Assistant asks for it while it is missing. If it still does not appear, open the mower's map in ECOVACS HOME once. The outline is saved and survives restarts.
+- On the O1200 LiDAR Pro, places the mower and the mowed path from its telemetry points, and the dock at the map origin. These points arrive every few minutes, so the marker moves in steps rather than smoothly.
 - Avoids spamming `*_V2` map errors that the previous G1-only code produced on these mowers.
 
-If you own an O-series mower and want fuller support (especially the area outline), the most useful thing you can provide is a sanitized capture from the official app **taken during active mowing**. See **Debug Capture** below and the issue tracker.
+If you own an O-series mower and the outline or marker is missing or misplaced, a debug capture with **Include raw payloads** on, with the ECOVACS HOME map open for a minute, is the most useful thing to attach. See **Debug Capture** below and the issue tracker.
 
 ## Why This Integration Exists
 
@@ -81,7 +82,7 @@ You need your ECOVACS account username, password, and country. The integration u
 
 During setup, choose a Home Assistant device name. A generated default such as `Ecovacs-GOAT-1` is provided.
 
-ECOVACS now requires a one-time **email device verification** for Home Assistant. After you submit your account details, check the email inbox for that ECOVACS account, enter the code, and keep using the same Home Assistant instance. The integration stores a stable client device id and keeps the verified account session in a **private Home Assistant store** (not in the config entry). Later startups reuse and rotate that session with `checkLogin`, so they do not password-login again. If the integration later asks you to reauthenticate, confirm the password and enter a fresh email code. You can also start that login yourself from **Settings → Devices & services → Ecovacs GOAT G1 → Configure → Re-authenticate account**.
+ECOVACS now requires a one-time **email device verification** for Home Assistant. After you submit your account details, check the email inbox for that ECOVACS account, enter the code, and keep using the same Home Assistant instance. The integration stores a stable client device id and keeps the verified account session in a **private Home Assistant store** (not in the config entry). Later startups reuse and rotate that session with `checkLogin`, so they do not password-login again. If that login fails, Home Assistant logs it, shows a sign-in notification, and opens reauthentication. The integration does not retry the login on its own, and it stops sending mower commands until you sign in. Confirm the password and enter a fresh email code if ECOVACS asks for one. You can also start that login yourself from **Settings → Devices & services → Ecovacs GOAT G1 → Configure → Re-authenticate account**.
 
 ## Optional Dashboard Card
 

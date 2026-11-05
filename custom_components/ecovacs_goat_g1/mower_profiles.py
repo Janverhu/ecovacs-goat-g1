@@ -24,12 +24,11 @@ Dock (``charge {act:"go"}``), ``appping``, ``getLifeSpan``, battery, error, and
 the ``getCleanInfo`` *status fields* (``state`` / ``cleanState.motionState`` /
 ``trigger`` / ``cid``) are shared, so the existing status parser handles both.
 
-The O-series map geometry (``getMapTrack`` / ``getMI`` / ``getAreaSet`` blobs)
-is **not decoded**: the only available O-series capture was taken while docked,
-where ``getMapTrack`` returns ``fail``, so there is no validated geometry sample.
-The O-series live map is therefore driven by the (shared, decodable) position
-stream; the map id is still learned so a future active-mowing capture can finish
-the work. O-series support remains **experimental / best-effort**.
+The O-series lawn outline arrives as ``onMI`` pushes and decodes from a
+direction chain (validated on an O1200 LiDAR Pro). ``getAreaSet`` decodes to
+area anchors. The ``getMI`` request body that triggers the push is not captured
+yet, so the coordinator tries candidate bodies while the outline is missing.
+O-series support remains **experimental / best-effort**.
 """
 
 from __future__ import annotations
