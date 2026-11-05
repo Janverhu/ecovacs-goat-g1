@@ -115,7 +115,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcovacsConfigEntry) -> b
 
     _async_register_services(hass)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    entry.async_on_unload(entry.add_update_listener(async_update_options))
     return True
+
+
+async def async_update_options(hass: HomeAssistant, entry: EcovacsConfigEntry) -> None:
+    """Apply changed options without a reload.
+
+    A reload would reconnect the mower and end a running debug capture.
+    """
+    entry.runtime_data.apply_options(entry.options)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: EcovacsConfigEntry) -> bool:
