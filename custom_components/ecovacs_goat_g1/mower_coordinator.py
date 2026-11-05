@@ -20,6 +20,7 @@ from .debug_capture import DebugCaptureStore
 from .goat_g1_models import classify_goat_g1_variant
 from .mower_profiles import MapDialect, profile_for_model
 from .mower_compat import (
+    RTK_OUTLINE_REQUEST_BODIES,
     ProtocolProfile,
     apply_resilient_getinfo_group,
     control_command_unsupported,
@@ -195,6 +196,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         self.data = self._base_state()
         self._protocol = ProtocolProfile(
             map_api_uses_v2=self._capability.map_uses_v2,
+            map_trace_uses_v2=self._capability.map_uses_v2,
             get_pos_fields=self._capability.position_fields,
         )
         self._last_mqtt_at: float | None = None
@@ -508,7 +510,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                     self._map_info_mid = state.map.mid
                     self._map_info_requests = 0
                     self._logged_incomplete_base_map = None
-                if command in {"onMapInfo_V2", "getMapInfo_V2"}:
+                if command in {"onMapInfo_V2", "getMapInfo_V2", "onMI"}:
                     if (
                         previous_state
                         and not previous_state.map.info.outline
@@ -1357,16 +1359,40 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         * ``getMapState`` for build status,
         * ``getRTK`` for the fixed base station position,
         * ``getMapTrack`` for virtual walls and ``getAreaSet`` for mowing areas
-          (their ``subsets`` blobs decode with the shared LZMA decoder).
+          (their ``subsets`` blobs decode with the shared LZMA decoder),
+        * ``getMI`` while the lawn outline is missing, at most a few times per
+          map. The outline itself arrives afterwards as ``onMI`` pushes.
 
-        The base-map outline itself is pushed over MQTT, not returned here, so it
-        is not part of this poll. The orchestration lives in
-        :func:`.mower_compat.refresh_rtk_map` so it can be unit-tested without a
-        Home Assistant runtime.
+        The orchestration lives in :func:`.mower_compat.refresh_rtk_map` so it
+        can be unit-tested without a Home Assistant runtime.
         """
         return await refresh_rtk_map(
-            self.api, self.device, state, capture=self._capture_event
+            self.api,
+            self.device,
+            state,
+            capture=self._capture_event,
+            outline_body=self._next_rtk_outline_body(state),
         )
+
+    def _next_rtk_outline_body(self, state: MowerState) -> dict[str, Any] | None:
+        """Return the getMI body for this attempt, or None when none is due.
+
+        Each attempt tries the next candidate body, so a capture shows which
+        request the onMI push followed.
+        """
+        if not self._device_mqtt_ready or state.map.info.outline:
+            return None
+        if self._map_info_mid != state.map.mid:
+            self._map_info_mid = state.map.mid
+            self._map_info_requests = 0
+            self._logged_incomplete_base_map = None
+        if self._map_info_requests >= MAX_BASE_MAP_INFO_REQUESTS:
+            return None
+        body = RTK_OUTLINE_REQUEST_BODIES[
+            self._map_info_requests % len(RTK_OUTLINE_REQUEST_BODIES)
+        ]
+        self._map_info_requests += 1
+        return dict(body)
 
     async def _async_refresh_live_position(self, state: MowerState) -> MowerState:
         """Refresh the mower, charger, and beacon positions."""

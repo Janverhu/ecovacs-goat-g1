@@ -196,6 +196,34 @@ async def test_refresh_rtk_map_fetches_layers_and_decodes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_refresh_rtk_map_requests_outline_when_asked() -> None:
+    """getMI is sent with the given body, and only when an outline is wanted."""
+    api = AsyncMock()
+    device = object()
+    events: list[tuple[str, dict]] = []
+    api.control.return_value = {"body": {"data": {}}}
+
+    await refresh_rtk_map(
+        api,
+        device,
+        MowerState(map=MowerMap(mid="1")),
+        capture=lambda event, data: events.append((event, data)),
+        outline_body={"type": "0"},
+    )
+
+    commands = [call.args[1] for call in api.control.call_args_list]
+    assert commands == ["getMapState", "getRTK", "getMI", "getMapTrack", "getAreaSet"]
+    assert api.control.call_args_list[2].args[2] == {"type": "0"}
+    assert events == [("rtk_outline_requested", {"body": {"type": "0"}})]
+
+    api.control.reset_mock()
+    await refresh_rtk_map(api, device, MowerState(map=MowerMap(mid="1")))
+
+    commands = [call.args[1] for call in api.control.call_args_list]
+    assert "getMI" not in commands
+
+
+@pytest.mark.asyncio
 async def test_refresh_rtk_map_survives_command_failures() -> None:
     """A failing RTK map command is logged/captured and does not abort the rest."""
     api = AsyncMock()

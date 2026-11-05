@@ -693,10 +693,10 @@ def test_lidar_origin_getpos_does_not_replace_telemetry() -> None:
     )
 
     assert state.map.current_position is not None
-    assert state.map.current_position.as_dict() == {"x": 5, "y": 8}
+    assert state.map.current_position.as_dict() == {"x": 4600, "y": 8200}
     assert [point.as_dict() for point in state.map.position_history] == [
-        {"x": 1, "y": 2},
-        {"x": 5, "y": 8},
+        {"x": 1200, "y": 2200},
+        {"x": 4600, "y": 8200},
     ]
 
 
@@ -709,6 +709,114 @@ def test_zero_robot_pos_is_ignored() -> None:
     )
 
     assert state.map.current_position is None
+
+
+def test_lidar_charge_stop_places_dock_at_origin() -> None:
+    """The LiDAR map is built from the dock, so chargerPos 0,0 is the dock."""
+    state = apply_command_data(
+        MowerState(),
+        "onFwBuryPoint-bd_task-charge-stop",
+        {"battery": 100, "chargerPos": "0,0"},
+    )
+
+    assert [point.as_dict() for point in state.map.charge_positions] == [
+        {"x": 0, "y": 0}
+    ]
+    assert state.map.current_position is None
+
+
+def test_lidar_signal_poses_extend_path_and_place_dock() -> None:
+    """bd_sysinfo samples give mowing poses, and a charger sample the dock."""
+    state = apply_command_data(
+        MowerState(activity=MowerActivity.MOWING),
+        "onFwBuryPoint-bd_sysinfo",
+        {
+            "signalInfos": [
+                {"charger": 0, "pose": "-737.2,-362.1,1.6,0", "workState": 1},
+                {"charger": 0, "pose": "0.000000,0.000000,0.000000,0"},
+                {"charger": 0, "pose": "-302.2,-1827.2,-1.4,0", "workState": 1},
+            ]
+        },
+    )
+
+    assert [point.as_dict() for point in state.map.position_history] == [
+        {"x": -737, "y": -362},
+        {"x": -302, "y": -1827},
+    ]
+    assert state.map.current_position is not None
+    assert state.map.current_position.as_dict() == {"x": -302, "y": -1827}
+
+    docked = apply_command_data(
+        MowerState(activity=MowerActivity.DOCKED),
+        "onFwBuryPoint-bd_sysinfo",
+        {"signalInfos": [{"charger": 1, "pose": "0.000000,0.000000,0.000000,0"}]},
+    )
+
+    assert [point.as_dict() for point in docked.map.charge_positions] == [
+        {"x": 0, "y": 0}
+    ]
+    assert docked.map.position_history == ()
+
+
+def _o_series_map_info(chain: str) -> dict:
+    """Return one onMI piece holding a single boundary chain."""
+    return {
+        "mid": "1",
+        "batid": "batch",
+        "serial": "1",
+        "index": "0",
+        "using": 1,
+        "type": "0",
+        "info": _make_subset([["1", f"s1;1;0,0;{chain}"], ["2", "1"]]),
+    }
+
+
+def test_o_series_map_info_decodes_chain_outline() -> None:
+    """onMI is a start point plus a direction chain in 50-unit steps."""
+    state = apply_command_data(
+        MowerState(),
+        "onMI",
+        _o_series_map_info("4(2)6(2)8(2)2(2)"),
+    )
+
+    assert [point.as_dict() for point in state.map.info.outline] == [
+        {"x": 0, "y": 0},
+        {"x": 100, "y": 0},
+        {"x": 100, "y": -100},
+        {"x": 0, "y": -100},
+        {"x": 0, "y": 0},
+    ]
+    assert state.map.mid == "1"
+
+
+def test_o_series_map_info_diagonal_steps() -> None:
+    """Odd digits are the diagonals, clockwise from north-west."""
+    state = apply_command_data(
+        MowerState(),
+        "onMI",
+        _o_series_map_info("357"),
+    )
+
+    assert [point.as_dict() for point in state.map.info.outline] == [
+        {"x": 0, "y": 0},
+        {"x": 50, "y": 50},
+        {"x": 100, "y": 0},
+        {"x": 50, "y": -50},
+    ]
+
+
+def test_o_series_malformed_chain_keeps_existing_outline() -> None:
+    """A chain with an unknown digit must not replace a decoded lawn."""
+    outline = (
+        MapPosition(x=0, y=0),
+        MapPosition(x=10, y=0),
+        MapPosition(x=10, y=10),
+    )
+    state = MowerState(map=MowerMap(info=MowerMapInfo(batch_id="batch", outline=outline)))
+
+    state = apply_command_data(state, "onMI", _o_series_map_info("4(2)9"))
+
+    assert state.map.info.outline == outline
 
 
 def test_incomplete_map_chunk_keeps_existing_outline() -> None:

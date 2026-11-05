@@ -28,6 +28,9 @@ _LOGGER = logging.getLogger(__name__)
 # When a mower rejects getCleanInfo_V2, try legacy clean info (same apply_command_data path).
 GETINFO_CLEAN_FALLBACKS: dict[str, str] = {"getCleanInfo_V2": "getCleanInfo"}
 GETINFO_UNSUPPORTED_FAILURE_THRESHOLD = 3
+# The getMI request body is not captured yet. onMI replies carry type "0",
+# which is also the G1 getMapInfo_V2 body, so that is tried first.
+RTK_OUTLINE_REQUEST_BODIES: tuple[dict[str, Any], ...] = ({"type": "0"}, {})
 
 
 def control_command_unsupported(err: BaseException) -> bool:
@@ -187,18 +190,25 @@ async def refresh_rtk_map(
     state: MowerState,
     *,
     capture: Callable[[str, dict[str, Any]], None] | None = None,
+    outline_body: dict[str, Any] | None = None,
 ) -> MowerState:
     """Best-effort O-series (RTK) map refresh.
 
     Reads map build state, the fixed RTK base station, and the virtual-wall
     (``getMapTrack``) / area (``getAreaSet``) map-set layers, whose ``subsets``
     blobs decode with the shared LZMA decoder. Each call degrades gracefully on
-    failure. The base-map outline itself is pushed over MQTT, not returned here,
-    so it is not part of this poll. ``getAreaSet`` reuses the active map id that
-    the live position stream (``getPos``) already learned.
+    failure. ``getAreaSet`` reuses the active map id that the live position
+    stream (``getPos``) already learned.
+
+    The lawn outline arrives afterwards as ``onMI`` pushes. ``getMI`` is sent
+    with ``outline_body`` only when the caller still needs the outline.
     """
     for command, payload in (("getMapState", {}), ("getRTK", {})):
         state = await _rtk_map_call(api, device, state, command, payload, capture)
+    if outline_body is not None:
+        if capture is not None:
+            capture("rtk_outline_requested", {"body": outline_body})
+        state = await _rtk_map_call(api, device, state, "getMI", outline_body, capture)
 
     mid = state.map.mid or "0"
     for command, payload in (
