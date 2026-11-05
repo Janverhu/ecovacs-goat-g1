@@ -1,6 +1,9 @@
 {
   "domain": "ecovacs_goat_g1",
   "name": "Ecovacs GOAT G1",
+  "categories": [
+    "garden_plants"
+  ],
   "codeowners": [
     "@Janverhu"
   ],
