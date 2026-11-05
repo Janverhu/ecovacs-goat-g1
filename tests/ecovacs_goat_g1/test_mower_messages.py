@@ -354,6 +354,14 @@ def test_ngiot_body_code_failure_raises_api_error() -> None:
         )
 
 
+def test_clean_v2_code_1_ok_is_rejected_with_raw_body() -> None:
+    """body.code 1 with msg ok is a rejected start, and the body stays visible."""
+    response = {"body": {"code": 1, "msg": "ok"}}
+    with pytest.raises(EcovacsApiError, match="code 1") as caught:
+        _raise_for_control_error("clean_V2", response)
+    assert "body={'code': 1, 'msg': 'ok'}" in str(caught.value)
+
+
 def test_ngiot_null_json_body_is_not_an_error() -> None:
     """Some models return JSON null on successful control (no structured payload)."""
     _raise_for_control_error("clean_V2", None)

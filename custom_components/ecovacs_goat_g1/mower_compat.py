@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, replace
 import logging
 from typing import TYPE_CHECKING, Any
 
-from .mower_api import EcovacsApiError
+from .mower_api import EcovacsApiError, EcovacsAuthError
 from .mower_messages import apply_response
 from .mower_models import MowerState
 
@@ -85,6 +85,8 @@ async def apply_resilient_getinfo_group(
             profile, getinfo_failures=failures
         )
     except EcovacsApiError as err:
+        if isinstance(err, EcovacsAuthError):
+            raise
         _LOGGER.debug(
             "ECOVACS grouped getInfo failed (%s); retrying %s per-command",
             err,
@@ -101,7 +103,9 @@ async def apply_resilient_getinfo_group(
             response = await api.control(device, "getInfo", [cmd])
             new_state = apply_response(new_state, "getInfo", response)
             failures.pop(cmd, None)
-        except EcovacsApiError:
+        except EcovacsApiError as err:
+            if isinstance(err, EcovacsAuthError):
+                raise
             _record_getinfo_failure(cmd, failures, unsupported)
             alt = GETINFO_CLEAN_FALLBACKS.get(cmd)
             if alt and alt not in unsupported:
@@ -109,7 +113,9 @@ async def apply_resilient_getinfo_group(
                     response = await api.control(device, "getInfo", [alt])
                     new_state = apply_response(new_state, "getInfo", response)
                     failures.pop(alt, None)
-                except EcovacsApiError:
+                except EcovacsApiError as alt_err:
+                    if isinstance(alt_err, EcovacsAuthError):
+                        raise
                     _record_getinfo_failure(alt, failures, unsupported)
                     _LOGGER.debug(
                         "ECOVACS getInfo %s and fallback %s are not supported",
@@ -170,6 +176,8 @@ async def refresh_live_position(
         response = await api.control(device, "getPos", fields)
         return apply_response(state, "getPos", response), profile
     except EcovacsApiError as err:
+        if isinstance(err, EcovacsAuthError):
+            raise
         if "uwbPos" in fields:
             _LOGGER.debug(
                 "ECOVACS getPos with uwbPos failed (%s); retrying without UWB fields",
@@ -232,6 +240,8 @@ async def _rtk_map_call(
         response = await api.control(device, command, payload)
         return apply_response(state, command, response)
     except EcovacsApiError as err:
+        if isinstance(err, EcovacsAuthError):
+            raise
         _LOGGER.debug("ECOVACS O-series %s failed: %s", command, err)
         if capture is not None:
             capture(

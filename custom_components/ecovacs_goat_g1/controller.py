@@ -36,12 +36,12 @@ from .const import (
 from .debug_capture import DebugCaptureStore
 from .mower_api import (
     AccountSession,
-    DeviceVerificationRequiredError,
     EcovacsAuthError,
     EcovacsMowerApi,
 )
 from .mower_coordinator import MowerCoordinator
 from .mower_models import MowerDevice
+from .reauth import async_dismiss_reauth_notification, async_publish_reauth_required
 from .session_store import AccountSessionStore
 from .util import get_client_device_id, get_session_store_id
 
@@ -128,21 +128,31 @@ class EcovacsController:
                     self._hass,
                     api,
                     device,
+                    self._entry,
                     self._debug_capture,
                 )
-                await coordinator.async_start()
+                try:
+                    await coordinator.async_start()
+                except BaseException:
+                    await coordinator.async_stop()
+                    raise
                 started.append(coordinator)
                 _LOGGER.info("Initialized ECOVACS mower %s", device.name)
+            async_dismiss_reauth_notification(self._hass, self._entry)
             self._coordinators = started
-        except DeviceVerificationRequiredError as ex:
-            raise ConfigEntryAuthFailed(
-                "ECOVACS device verification required"
-            ) from ex
-        except EcovacsAuthError as ex:
-            raise ConfigEntryAuthFailed("Invalid ECOVACS credentials") from ex
+        except ConfigEntryAuthFailed:
+            await self._stop_coordinators(started)
+            raise
         except ConfigEntryNotReady:
             await self._stop_coordinators(started)
             raise
+        except EcovacsAuthError as ex:
+            await self._stop_coordinators(started)
+            if self._api is not None:
+                async_publish_reauth_required(self._hass, self._entry, self._api, ex)
+            raise ConfigEntryAuthFailed(
+                "ECOVACS sign-in required. Automatic login will not be retried."
+            ) from ex
         except Exception as ex:
             await self._stop_coordinators(started)
             raise ConfigEntryNotReady("Error during ECOVACS mower setup") from ex

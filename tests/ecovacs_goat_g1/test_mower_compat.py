@@ -17,7 +17,7 @@ ecovacs_goat_g1 = types.ModuleType("custom_components.ecovacs_goat_g1")
 ecovacs_goat_g1.__path__ = [str(PACKAGE_PATH)]
 sys.modules.setdefault("custom_components.ecovacs_goat_g1", ecovacs_goat_g1)
 
-from custom_components.ecovacs_goat_g1.mower_api import EcovacsApiError
+from custom_components.ecovacs_goat_g1.mower_api import EcovacsApiError, EcovacsAuthError
 from custom_components.ecovacs_goat_g1.mower_compat import (
     GETINFO_UNSUPPORTED_FAILURE_THRESHOLD,
     ProtocolProfile,
@@ -121,6 +121,36 @@ async def test_resilient_getinfo_uses_clean_info_fallback_after_v2_disabled() ->
 
     assert state.raw["getCleanInfo"]["state"] == "idle"
     assert api.control.call_args_list[0][0][2] == ["getCleanInfo"]
+
+
+@pytest.mark.asyncio
+async def test_getinfo_login_failure_is_not_retried_per_command() -> None:
+    """A login failure must not fan out into one getInfo call per command."""
+    api = AsyncMock()
+    api.control = AsyncMock(side_effect=EcovacsAuthError("invalid credentials"))
+
+    with pytest.raises(EcovacsAuthError):
+        await apply_resilient_getinfo_group(
+            api,
+            object(),
+            MowerState(),
+            ("getBattery", "getError", "getStats"),
+            ProtocolProfile(),
+        )
+
+    assert api.control.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_live_position_does_not_retry_login_failure() -> None:
+    """A login failure must not be followed by a second getPos."""
+    api = AsyncMock()
+    api.control = AsyncMock(side_effect=EcovacsAuthError("invalid credentials"))
+
+    with pytest.raises(EcovacsAuthError):
+        await refresh_live_position(api, object(), MowerState(), ProtocolProfile())
+
+    assert api.control.await_count == 1
 
 
 @pytest.mark.asyncio

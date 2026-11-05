@@ -10,9 +10,10 @@ from math import atan2, degrees, hypot
 from time import monotonic, time
 from typing import Any
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import Event, HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -27,7 +28,8 @@ from .mower_compat import (
     refresh_live_position,
     refresh_rtk_map,
 )
-from .mower_api import EcovacsApiError, EcovacsMowerApi
+from .mower_api import EcovacsApiError, EcovacsAuthError, EcovacsMowerApi
+from .reauth import async_publish_reauth_required
 from .mower_messages import (
     MOWING_EFFICIENCY_LEVELS,
     OBSTACLE_AVOIDANCE_LEVELS,
@@ -182,13 +184,16 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         hass: HomeAssistant,
         api: EcovacsMowerApi,
         device: MowerDevice,
+        config_entry: ConfigEntry,
         debug_capture: DebugCaptureStore | None = None,
     ) -> None:
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=f"ECOVACS GOAT {device.did}",
         )
+        self._config_entry = config_entry
         self.api = api
         self.device = device
         self._debug_capture = debug_capture
@@ -450,6 +455,39 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         position_history, _outline, _obstacles = await self._async_load_saved_map()
         return position_history
 
+    def _login_is_blocked(self) -> bool:
+        """Return whether a login failure is waiting for the user to sign in."""
+        return self.api.reauth_required
+
+    def _halt_for_login_failure(self, err: BaseException) -> bool:
+        """Stop command retries when ECOVACS needs the user to sign in again.
+
+        Any auth error blocks further polls, including a checkLogin failure that
+        is neither invalid credentials nor device verification.
+        """
+        if not isinstance(err, EcovacsAuthError) and not self.api.reauth_required:
+            return False
+        async_publish_reauth_required(self.hass, self._config_entry, self.api, err)
+        self._cancel_command_retries()
+        return True
+
+    def _cancel_command_retries(self) -> None:
+        """Cancel in-flight mower polls so a failed login is not repeated."""
+        current = asyncio.current_task()
+        tasks: list[asyncio.Task[None] | None] = [
+            self._mqtt_readback_task,
+            self._returning_refresh_task,
+            self._mowing_position_refresh_task,
+            self._trace_refresh_task,
+            self._live_position_stream_task,
+            self._live_position_keepalive_task,
+            self._startup_live_map_task,
+            *self._outcome_refresh_tasks.values(),
+        ]
+        for task in tasks:
+            if task is not None and task is not current and not task.done():
+                task.cancel()
+
     async def _async_update_data(self) -> MowerState:
         """Refresh from the mower using a small app-style command set."""
         try:
@@ -463,12 +501,23 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                     response = await self.api.control(self.device, command, payload)
                     state = apply_response(state, command, response)
                 except EcovacsApiError as err:
+                    if self._halt_for_login_failure(err):
+                        raise
                     _LOGGER.debug(
                         "ECOVACS coordinator update skipped %s: %s", command, err
                     )
+        except EcovacsAuthError as err:
+            self._halt_for_login_failure(err)
+            raise ConfigEntryAuthFailed(
+                "ECOVACS sign-in required. Automatic login will not be retried."
+            ) from err
         except EcovacsApiError as err:
             raise UpdateFailed(str(err)) from err
         except Exception as err:
+            if self._halt_for_login_failure(err):
+                raise ConfigEntryAuthFailed(
+                    "ECOVACS sign-in required. Automatic login will not be retried."
+                ) from err
             raise UpdateFailed(f"Unexpected ECOVACS update error: {err}") from err
 
         return state
@@ -659,6 +708,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
 
     def _schedule_trace_refresh(self) -> None:
         """Request the mower trace after enough live heading change."""
+        if self._login_is_blocked():
+            return
         if self._trace_refresh_task and not self._trace_refresh_task.done():
             return
         self._trace_refresh_task = self._create_background_task(
@@ -695,6 +746,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 },
             )
         except EcovacsApiError as err:
+            if self._halt_for_login_failure(err):
+                return
             if control_command_unsupported(err):
                 self._protocol = replace(self._protocol, map_trace_uses_v2=False)
                 _LOGGER.warning(
@@ -719,6 +772,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
 
     def _schedule_mqtt_readback(self) -> None:
         """Debounce a full readback after MQTT reports an actionable change."""
+        if self._login_is_blocked():
+            return
         if self._mqtt_readback_task and not self._mqtt_readback_task.done():
             self._mqtt_readback_task.cancel()
         self._mqtt_readback_task = self._create_background_task(
@@ -734,6 +789,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         except asyncio.CancelledError:
             raise
         except Exception as err:
+            if self._halt_for_login_failure(err):
+                return
             _LOGGER.debug("ECOVACS actionable MQTT readback failed", exc_info=True)
             self._capture_event(
                 "mqtt_readback_error",
@@ -742,6 +799,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
 
     def _ensure_returning_refresh(self) -> None:
         """Poll lightly while returning because ECOVACS may stop position pushes at dock."""
+        if self._login_is_blocked():
+            return
         if self._returning_refresh_task and not self._returning_refresh_task.done():
             return
         self._returning_refresh_task = self._create_background_task(
@@ -752,10 +811,18 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
     async def _async_refresh_while_returning(self) -> None:
         """Refresh until the mower reports a final docked/idle state."""
         while self.data and self.data.activity is MowerActivity.RETURNING:
+            if self._login_is_blocked():
+                return
             await asyncio.sleep(RETURNING_REFRESH_SECONDS)
+            if self._login_is_blocked():
+                return
             if not self.data or self.data.activity is not MowerActivity.RETURNING:
                 return
-            self.async_set_updated_data(await self._async_refresh_state_groups())
+            try:
+                self.async_set_updated_data(await self._async_refresh_state_groups())
+            except EcovacsAuthError as err:
+                self._halt_for_login_failure(err)
+                return
 
     def _ensure_mowing_position_refresh(self) -> None:
         """Start the conservative live-position fallback while mowing.
@@ -763,6 +830,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         MQTT onPos is the preferred position source. This task only fills gaps when
         onPos has gone stale; it is not intended to drive normal map animation.
         """
+        if self._login_is_blocked():
+            return
         if (
             self._mowing_position_refresh_task
             and not self._mowing_position_refresh_task.done()
@@ -780,7 +849,11 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         mower trace on the same slow poll so completed mowing lines stay visible.
         """
         while self.data and self.data.activity is MowerActivity.MOWING:
+            if self._login_is_blocked():
+                return
             await asyncio.sleep(MOWING_POSITION_REFRESH_SECONDS)
+            if self._login_is_blocked():
+                return
             if not self.data or self.data.activity is not MowerActivity.MOWING:
                 return
             if self._has_recent_position_mqtt():
@@ -791,6 +864,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 self._trace_update_due = True
                 self._schedule_trace_refresh()
             except EcovacsApiError as err:
+                if self._halt_for_login_failure(err):
+                    return
                 _LOGGER.debug("ECOVACS mowing position refresh failed: %s", err)
                 self._capture_event(
                     "mowing_position_refresh_error",
@@ -812,6 +887,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         duration_seconds: int | None = None,
     ) -> None:
         """Request fast app-style position updates for a visible live map card."""
+        if self._login_is_blocked():
+            return
         if duration_seconds is not None and duration_seconds > 0:
             self._extend_live_position_keepalive(
                 reason,
@@ -835,6 +912,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         force: bool,
     ) -> None:
         """Keep the app-style map session alive for an explicit short window."""
+        if self._login_is_blocked():
+            return
         duration_seconds = max(1, duration_seconds)
         until = monotonic() + duration_seconds
         self._live_position_keepalive_until = max(
@@ -870,6 +949,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 self._live_position_keepalive_until is not None
                 and monotonic() < self._live_position_keepalive_until
             ):
+                if self._login_is_blocked():
+                    return
                 state = self.data or self._base_state()
                 if force or state.activity in LIVE_POSITION_STREAM_ACTIVITIES:
                     try:
@@ -883,7 +964,11 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                             self._compact_live_position_segment(state)
                         )
                     except EcovacsApiError as err:
-                        _LOGGER.debug("ECOVACS live position keepalive failed: %s", err)
+                        if self._halt_for_login_failure(err):
+                            return
+                        _LOGGER.debug(
+                            "ECOVACS live position keepalive failed: %s", err
+                        )
                         self._capture_event(
                             "live_position_keepalive_error",
                             {"reason": reason, "exception": repr(err)},
@@ -907,6 +992,10 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
 
     async def _async_send_app_ping(self, reason: str) -> None:
         """Send the GOAT app's lightweight MQTT keepalive command."""
+        if self._login_is_blocked():
+            raise EcovacsAuthError(
+                "ECOVACS login expired; reauthentication required"
+            )
         await self.api.control(self.device, "appping", {})
         self._capture_event("app_ping_sent", {"reason": reason})
 
@@ -914,6 +1003,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         self, reason: str, *, force: bool = False
     ) -> None:
         """Request the app-style live map stream in the background."""
+        if self._login_is_blocked():
+            return
         if self._live_position_stream_task and not self._live_position_stream_task.done():
             return
         self._live_position_stream_task = self._create_background_task(
@@ -935,6 +1026,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         except asyncio.CancelledError:
             raise
         except EcovacsApiError as err:
+            if self._halt_for_login_failure(err):
+                return
             _LOGGER.debug("ECOVACS live position stream request failed: %s", err)
             self._capture_event(
                 "live_position_stream_request_error",
@@ -952,6 +1045,10 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         force: bool = False,
     ) -> MowerState:
         """Ask ECOVACS for the app map view, which triggers fast onPos pushes."""
+        if self._login_is_blocked():
+            raise EcovacsAuthError(
+                "ECOVACS login expired; reauthentication required"
+            )
         if not force and state.activity not in LIVE_POSITION_STREAM_ACTIVITIES:
             self._capture_event(
                 "live_position_stream_request_skipped",
@@ -1049,6 +1146,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                         {"mid": mid, "bdTaskID": self._next_app_bd_task_id()},
                     )
             except EcovacsApiError as err:
+                if self._halt_for_login_failure(err):
+                    raise
                 _LOGGER.warning(
                     "ECOVACS live map stream V2 calls failed; using position/MQTT only: %s",
                     err,
@@ -1074,6 +1173,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         try:
             await self._app_presence_mqtt.start()
         except Exception as err:  # noqa: BLE001 - experimental side channel only
+            if self._halt_for_login_failure(err):
+                raise
             _LOGGER.warning("ECOVACS app-presence MQTT start failed: %s", err)
             self._capture_event(
                 "app_presence_mqtt_start_error",
@@ -1136,6 +1237,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         initial_delay: int = COMMAND_VERIFY_INITIAL_DELAY_SECONDS,
     ) -> None:
         """Verify a command outcome with bounded readback polling."""
+        if self._login_is_blocked():
+            return
         existing = self._outcome_refresh_tasks.get(key)
         if existing and not existing.done():
             existing.cancel()
@@ -1164,6 +1267,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             await asyncio.sleep(initial_delay)
             deadline = monotonic() + timeout
             while monotonic() <= deadline:
+                if self._login_is_blocked():
+                    return
                 state = await self._async_refresh_state_groups()
                 self.async_set_updated_data(state)
                 if predicate(state):
@@ -1183,6 +1288,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         except asyncio.CancelledError:
             raise
         except Exception as err:
+            if self._halt_for_login_failure(err):
+                return
             _LOGGER.debug("ECOVACS command outcome poll %s failed", key, exc_info=True)
             self._capture_event(
                 "command_outcome_error",
@@ -1199,11 +1306,23 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         _LOGGER.debug(
             "Refreshing ECOVACS mower state before command because live updates are stale"
         )
-        self.async_set_updated_data(await self._async_refresh_state_groups())
+        try:
+            self.async_set_updated_data(await self._async_refresh_state_groups())
+        except EcovacsAuthError as err:
+            self._halt_for_login_failure(err)
+            raise HomeAssistantError(
+                "ECOVACS sign-in required. Re-authenticate the integration."
+            ) from err
 
     async def async_refresh_state(self) -> None:
         """Force a grouped state refresh from the mower."""
-        self.async_set_updated_data(await self._async_refresh_state_groups())
+        try:
+            self.async_set_updated_data(await self._async_refresh_state_groups())
+        except EcovacsAuthError as err:
+            self._halt_for_login_failure(err)
+            raise HomeAssistantError(
+                "ECOVACS sign-in required. Re-authenticate the integration."
+            ) from err
 
     def _startup_getinfo_groups(self) -> tuple[tuple[str, ...], ...]:
         """Return startup getInfo groups adapted to this model's dialect.
@@ -1222,6 +1341,10 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
 
     async def _async_refresh_state_groups(self) -> MowerState:
         """Refresh only the app-captured grouped state/settings payloads."""
+        if self._login_is_blocked():
+            raise EcovacsAuthError(
+                "ECOVACS login expired; reauthentication required"
+            )
         state = self.data or self._base_state()
         for group in self._startup_getinfo_groups():
             state, self._protocol = await apply_resilient_getinfo_group(
@@ -1237,9 +1360,15 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
 
     async def _async_refresh_live_map(self, state: MowerState) -> MowerState:
         """Refresh live map position and request a map trace push."""
+        if self._login_is_blocked():
+            raise EcovacsAuthError(
+                "ECOVACS login expired; reauthentication required"
+            )
         try:
             state = await self._async_refresh_live_position(state)
         except EcovacsApiError as err:
+            if self._halt_for_login_failure(err):
+                raise
             _LOGGER.debug("ECOVACS live position refresh failed: %s", err)
             return state
 
@@ -1259,6 +1388,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             )
             state = apply_response(state, "getMapTrace_V2", response)
         except EcovacsApiError as err:
+            if self._halt_for_login_failure(err):
+                raise
             if control_command_unsupported(err):
                 self._protocol = replace(self._protocol, map_trace_uses_v2=False)
                 _LOGGER.warning(
@@ -1301,6 +1432,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 {"type": "0"},
             )
         except EcovacsApiError as err:
+            if self._halt_for_login_failure(err):
+                raise
             _LOGGER.debug("ECOVACS base map request failed: %s", err)
             return state
         state = apply_response(state, "getMapInfo_V2", response)
@@ -1404,10 +1537,18 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
     async def _async_refresh_live_map_after_mqtt_start(self) -> None:
         """Request live map data after MQTT has had time to subscribe."""
         for delay in (5, 10):
+            if self._login_is_blocked():
+                return
             await asyncio.sleep(delay)
-            self.async_set_updated_data(
-                await self._async_refresh_live_map(self.data or self._base_state())
-            )
+            if self._login_is_blocked():
+                return
+            try:
+                self.async_set_updated_data(
+                    await self._async_refresh_live_map(self.data or self._base_state())
+                )
+            except EcovacsAuthError as err:
+                self._halt_for_login_failure(err)
+                return
             if self.data and self.data.map.info.outline:
                 return
 
@@ -1472,14 +1613,24 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         refresh_if_stale: bool = True,
     ) -> None:
         """Execute a command and merge the response into the cache."""
-        if refresh_if_stale:
-            await self.async_refresh_if_stale()
-        payload = self._command_payload(command, data or {})
-        response = await self.api.control(self.device, command, payload)
+        try:
+            if refresh_if_stale:
+                await self.async_refresh_if_stale()
+            payload = self._command_payload(command, data or {})
+            response = await self.api.control(self.device, command, payload)
+        except EcovacsAuthError as err:
+            self._halt_for_login_failure(err)
+            raise HomeAssistantError(
+                "ECOVACS sign-in required. Re-authenticate the integration."
+            ) from err
         self.async_set_updated_data(apply_response(self.data, command, response))
 
     async def start_mowing(self) -> None:
         """Start or resume mowing using app-captured clean_V2 bodies."""
+        if self._login_is_blocked():
+            raise HomeAssistantError(
+                "ECOVACS sign-in required. Re-authenticate the integration."
+            )
         await self.async_refresh_if_stale()
         previous_activity = self.data.activity
         act = (

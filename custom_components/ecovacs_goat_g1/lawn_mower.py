@@ -9,10 +9,12 @@ from homeassistant.components.lawn_mower import (
     LawnMowerEntityFeature,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import EcovacsConfigEntry
 from .entity import EcovacsMowerEntity
+from .mower_api import EcovacsApiError, EcovacsAuthError
 from .mower_models import MowerActivity
 
 STATE_IDLE = "idle"
@@ -61,7 +63,16 @@ class EcovacsMower(EcovacsMowerEntity, LawnMowerEntity):
 
     async def async_start_mowing(self) -> None:
         """Start or resume mowing."""
-        await self.coordinator.start_mowing()
+        try:
+            await self.coordinator.start_mowing()
+        except HomeAssistantError:
+            raise
+        except EcovacsAuthError as err:
+            raise HomeAssistantError(
+                "ECOVACS sign-in required. Re-authenticate the integration."
+            ) from err
+        except EcovacsApiError as err:
+            raise HomeAssistantError(f"Mower rejected start: {err}") from err
 
     async def async_pause(self) -> None:
         """Pause mowing."""
