@@ -2,8 +2,9 @@
 # Install: pip install pre-commit && pre-commit install
 # Run manually: pre-commit run --all-files
 #
-# Tooling: gitleaks-docker (secrets), semgrep-docker (SAST), trivyfs-docker (vulns),
-# pip-audit (Python CVEs; closest analogue here to npm audit — there is no package.json).
+# Tooling: pytest (unit tests), gitleaks-docker (secrets), semgrep-docker (SAST),
+# trivyfs-docker (vulns), pip-audit (Python CVEs; closest analogue here to npm
+# audit — there is no package.json).
 # Docker is required for the three *-docker hooks (Semgrep has no Windows wheel).
 # require-docker runs first and fail_fast stops the commit when the daemon is down.
 
@@ -26,6 +27,21 @@ repos:
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
+
+  - repo: local
+    hooks:
+      - id: pytest
+        name: Unit tests
+        entry: pytest tests/ecovacs_goat_g1 -q
+        language: python
+        additional_dependencies:
+          - pytest
+          - pytest-asyncio
+          - aiohttp
+          - cryptography
+          - paho-mqtt>=2.1.0
+        pass_filenames: false
+        files: ^(custom_components/ecovacs_goat_g1|tests)/.*\.py$
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.1

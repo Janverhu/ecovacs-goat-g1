@@ -16,7 +16,6 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from .mower_api import EcovacsApiError, EcovacsAuthError
-from .mower_messages import apply_response
 from .mower_models import MowerState
 
 if TYPE_CHECKING:
@@ -24,6 +23,11 @@ if TYPE_CHECKING:
     from .mower_models import MowerDevice
 
 _LOGGER = logging.getLogger(__name__)
+
+# Merges one command reply into the latest cached state and returns it. Pushes
+# arrive while a command is pending, so replies must not be applied to a state
+# captured before the request.
+ReplyMerger = Callable[[str, Any], MowerState]
 
 # When a mower rejects getCleanInfo_V2, try legacy clean info (same apply_command_data path).
 GETINFO_CLEAN_FALLBACKS: dict[str, str] = {"getCleanInfo_V2": "getCleanInfo"}
@@ -67,23 +71,22 @@ class ProtocolProfile:
 async def apply_resilient_getinfo_group(
     api: EcovacsMowerApi,
     device: MowerDevice,
-    state: MowerState,
+    merge_reply: ReplyMerger,
     commands: tuple[str, ...],
     profile: ProtocolProfile,
-) -> tuple[MowerState, ProtocolProfile]:
+) -> ProtocolProfile:
     """Apply one getInfo group, falling back to per-command reads if the batch fails."""
     active = _active_getinfo_commands(commands, profile.unsupported_getinfo)
     if not active:
-        return state, profile
+        return profile
 
     try:
         response = await api.control(device, "getInfo", active)
         failures = dict(profile.getinfo_failures)
         for cmd in active:
             failures.pop(cmd, None)
-        return apply_response(state, "getInfo", response), replace(
-            profile, getinfo_failures=failures
-        )
+        merge_reply("getInfo", response)
+        return replace(profile, getinfo_failures=failures)
     except EcovacsApiError as err:
         if isinstance(err, EcovacsAuthError):
             raise
@@ -95,13 +98,12 @@ async def apply_resilient_getinfo_group(
 
     unsupported = set(profile.unsupported_getinfo)
     failures = dict(profile.getinfo_failures)
-    new_state = state
     for cmd in active:
         if cmd in unsupported:
             continue
         try:
             response = await api.control(device, "getInfo", [cmd])
-            new_state = apply_response(new_state, "getInfo", response)
+            merge_reply("getInfo", response)
             failures.pop(cmd, None)
         except EcovacsApiError as err:
             if isinstance(err, EcovacsAuthError):
@@ -111,7 +113,7 @@ async def apply_resilient_getinfo_group(
             if alt and alt not in unsupported:
                 try:
                     response = await api.control(device, "getInfo", [alt])
-                    new_state = apply_response(new_state, "getInfo", response)
+                    merge_reply("getInfo", response)
                     failures.pop(alt, None)
                 except EcovacsApiError as alt_err:
                     if isinstance(alt_err, EcovacsAuthError):
@@ -125,7 +127,7 @@ async def apply_resilient_getinfo_group(
             else:
                 _LOGGER.debug("ECOVACS getInfo %s is not supported on this device", cmd)
 
-    return new_state, replace(
+    return replace(
         profile,
         unsupported_getinfo=frozenset(unsupported),
         getinfo_failures=failures,
@@ -167,14 +169,13 @@ def _active_getinfo_commands(
 async def refresh_live_position(
     api: EcovacsMowerApi,
     device: MowerDevice,
-    state: MowerState,
+    merge_reply: ReplyMerger,
     profile: ProtocolProfile,
-) -> tuple[MowerState, ProtocolProfile]:
+) -> ProtocolProfile:
     """Refresh getPos, dropping optional fields the firmware rejects."""
     fields = list(profile.get_pos_fields)
     try:
         response = await api.control(device, "getPos", fields)
-        return apply_response(state, "getPos", response), profile
     except EcovacsApiError as err:
         if isinstance(err, EcovacsAuthError):
             raise
@@ -188,57 +189,66 @@ async def refresh_live_position(
             )
             if reduced != profile.get_pos_fields:
                 profile = replace(profile, get_pos_fields=reduced)
-                return await refresh_live_position(api, device, state, profile)
+                return await refresh_live_position(api, device, merge_reply, profile)
         raise
+    merge_reply("getPos", response)
+    return profile
 
 
 async def refresh_rtk_map(
     api: EcovacsMowerApi,
     device: MowerDevice,
     state: MowerState,
+    merge_reply: ReplyMerger,
     *,
     capture: Callable[[str, dict[str, Any]], None] | None = None,
     outline_body: dict[str, Any] | None = None,
-) -> MowerState:
+) -> None:
     """Best-effort O-series (RTK) map refresh.
 
     Reads map build state, the fixed RTK base station, and the virtual-wall
     (``getMapTrack``) / area (``getAreaSet``) map-set layers, whose ``subsets``
     blobs decode with the shared LZMA decoder. Each call degrades gracefully on
     failure. ``getAreaSet`` reuses the active map id that the live position
-    stream (``getPos``) already learned.
+    stream (``getPos``) already learned; ``state`` is the cache when the refresh
+    starts and only supplies that id until a reply is merged.
 
     The lawn outline arrives afterwards as ``onMI`` pushes. ``getMI`` is sent
     with ``outline_body`` only when the caller still needs the outline.
     """
     for command, payload in (("getMapState", {}), ("getRTK", {})):
-        state = await _rtk_map_call(api, device, state, command, payload, capture)
+        state = await _rtk_map_call(
+            api, device, state, merge_reply, command, payload, capture
+        )
     if outline_body is not None:
         if capture is not None:
             capture("rtk_outline_requested", {"body": outline_body})
-        state = await _rtk_map_call(api, device, state, "getMI", outline_body, capture)
+        state = await _rtk_map_call(
+            api, device, state, merge_reply, "getMI", outline_body, capture
+        )
 
     mid = state.map.mid or "0"
     for command, payload in (
         ("getMapTrack", {}),
         ("getAreaSet", {"mid": mid, "aid": "0", "type": "ar"}),
     ):
-        state = await _rtk_map_call(api, device, state, command, payload, capture)
-    return state
+        state = await _rtk_map_call(
+            api, device, state, merge_reply, command, payload, capture
+        )
 
 
 async def _rtk_map_call(
     api: EcovacsMowerApi,
     device: MowerDevice,
     state: MowerState,
+    merge_reply: ReplyMerger,
     command: str,
     payload: Any,
     capture: Callable[[str, dict[str, Any]], None] | None,
 ) -> MowerState:
-    """Run one RTK map command, applying its response or logging a failure."""
+    """Run one RTK map command, merging its reply or logging a failure."""
     try:
         response = await api.control(device, command, payload)
-        return apply_response(state, command, response)
     except EcovacsApiError as err:
         if isinstance(err, EcovacsAuthError):
             raise
@@ -249,3 +259,4 @@ async def _rtk_map_call(
                 {"command": command, "exception": repr(err)},
             )
         return state
+    return merge_reply(command, response)

@@ -62,7 +62,7 @@ class EcovacsController:
             Path(hass.config.path("ecovacs_goat_g1_debug")),
             Path(hass.config.path("www", "ecovacs_goat", "debug")),
         )
-        self._configure_debug_capture(entry.options)
+        self.apply_options(entry.options)
         self._device_id = get_client_device_id(config)
         self._store_id = get_session_store_id(config)
         self._session_store = AccountSessionStore(
@@ -244,7 +244,7 @@ class EcovacsController:
         """Return debug capture store."""
         return self._debug_capture
 
-    def _configure_debug_capture(self, options: Mapping[str, Any]) -> None:
+    def apply_options(self, options: Mapping[str, Any]) -> None:
         """Apply capture defaults from config entry options."""
         self._debug_capture.configure(
             include_raw_payloads=bool(

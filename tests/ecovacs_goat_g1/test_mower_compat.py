@@ -26,7 +26,19 @@ from custom_components.ecovacs_goat_g1.mower_compat import (
     refresh_live_position,
     refresh_rtk_map,
 )
+from custom_components.ecovacs_goat_g1.mower_messages import apply_response
 from custom_components.ecovacs_goat_g1.mower_models import MowerMap, MowerState
+
+
+class _Cache:
+    """Merge command replies into one state, as the coordinator does."""
+
+    def __init__(self, state: MowerState | None = None) -> None:
+        self.state = state or MowerState()
+
+    def merge(self, command: str, response: dict) -> MowerState:
+        self.state = apply_response(self.state, command, response)
+        return self.state
 
 
 def _make_subset(obj) -> str:
@@ -60,15 +72,16 @@ async def test_resilient_getinfo_keeps_single_failures_retryable() -> None:
         EcovacsApiError("unsupported"),
     ]
 
-    state, profile = await apply_resilient_getinfo_group(
+    cache = _Cache()
+    profile = await apply_resilient_getinfo_group(
         api,
         device,
-        MowerState(),
+        cache.merge,
         ("getBattery", "getOta"),
         ProtocolProfile(),
     )
 
-    assert state.battery == 88
+    assert cache.state.battery == 88
     assert "getOta" not in profile.unsupported_getinfo
     assert profile.getinfo_failures["getOta"] == 1
     assert api.control.call_count == 3
@@ -86,10 +99,10 @@ async def test_resilient_getinfo_marks_repeated_failures_unsupported() -> None:
             EcovacsApiError("batch failed"),
             EcovacsApiError("unsupported"),
         ]
-        _, profile = await apply_resilient_getinfo_group(
+        profile = await apply_resilient_getinfo_group(
             api,
             device,
-            MowerState(),
+            _Cache().merge,
             ("getOta",),
             profile,
         )
@@ -111,15 +124,16 @@ async def test_resilient_getinfo_uses_clean_info_fallback_after_v2_disabled() ->
         }
     }
 
-    state, _ = await apply_resilient_getinfo_group(
+    cache = _Cache()
+    await apply_resilient_getinfo_group(
         api,
         device,
-        MowerState(),
+        cache.merge,
         ("getCleanInfo_V2",),
         profile,
     )
 
-    assert state.raw["getCleanInfo"]["state"] == "idle"
+    assert cache.state.raw["getCleanInfo"]["state"] == "idle"
     assert api.control.call_args_list[0][0][2] == ["getCleanInfo"]
 
 
@@ -133,7 +147,7 @@ async def test_getinfo_login_failure_is_not_retried_per_command() -> None:
         await apply_resilient_getinfo_group(
             api,
             object(),
-            MowerState(),
+            _Cache().merge,
             ("getBattery", "getError", "getStats"),
             ProtocolProfile(),
         )
@@ -148,7 +162,7 @@ async def test_refresh_live_position_does_not_retry_login_failure() -> None:
     api.control = AsyncMock(side_effect=EcovacsAuthError("invalid credentials"))
 
     with pytest.raises(EcovacsAuthError):
-        await refresh_live_position(api, object(), MowerState(), ProtocolProfile())
+        await refresh_live_position(api, object(), _Cache().merge, ProtocolProfile())
 
     assert api.control.await_count == 1
 
@@ -163,13 +177,12 @@ async def test_refresh_live_position_drops_uwb_on_error() -> None:
         {"body": {"data": {"deebotPos": {"x": 1, "y": 2}}}},
     ]
     profile = ProtocolProfile()
+    cache = _Cache()
 
-    state, profile_out = await refresh_live_position(
-        api, device, MowerState(), profile
-    )
+    profile_out = await refresh_live_position(api, device, cache.merge, profile)
 
-    assert state.map.current_position is not None
-    assert state.map.current_position.x == 1
+    assert cache.state.map.current_position is not None
+    assert cache.state.map.current_position.x == 1
     assert "uwbPos" not in profile_out.get_pos_fields
     assert api.control.call_args_list[0][0][2] == ["chargePos", "deebotPos", "uwbPos"]
     assert api.control.call_args_list[1][0][2] == ["chargePos", "deebotPos"]
@@ -208,9 +221,9 @@ async def test_refresh_rtk_map_fetches_layers_and_decodes() -> None:
     ]
 
     # Pre-seed the map id as the live position stream (getPos) would.
-    state = await refresh_rtk_map(
-        api, device, MowerState(map=MowerMap(mid="1"))
-    )
+    cache = _Cache(MowerState(map=MowerMap(mid="1")))
+    await refresh_rtk_map(api, device, cache.state, cache.merge)
+    state = cache.state
 
     assert state.map.rtk_station is not None and state.map.rtk_station.x == 578
     assert state.map.no_go_zones == ()
@@ -233,10 +246,12 @@ async def test_refresh_rtk_map_requests_outline_when_asked() -> None:
     events: list[tuple[str, dict]] = []
     api.control.return_value = {"body": {"data": {}}}
 
+    cache = _Cache(MowerState(map=MowerMap(mid="1")))
     await refresh_rtk_map(
         api,
         device,
-        MowerState(map=MowerMap(mid="1")),
+        cache.state,
+        cache.merge,
         capture=lambda event, data: events.append((event, data)),
         outline_body={"type": "0"},
     )
@@ -247,7 +262,8 @@ async def test_refresh_rtk_map_requests_outline_when_asked() -> None:
     assert events == [("rtk_outline_requested", {"body": {"type": "0"}})]
 
     api.control.reset_mock()
-    await refresh_rtk_map(api, device, MowerState(map=MowerMap(mid="1")))
+    cache = _Cache(MowerState(map=MowerMap(mid="1")))
+    await refresh_rtk_map(api, device, cache.state, cache.merge)
 
     commands = [call.args[1] for call in api.control.call_args_list]
     assert "getMI" not in commands
@@ -273,15 +289,17 @@ async def test_refresh_rtk_map_survives_command_failures() -> None:
         },
     ]
 
-    state = await refresh_rtk_map(
+    cache = _Cache(MowerState(map=MowerMap(mid="2")))
+    await refresh_rtk_map(
         api,
         device,
-        MowerState(map=MowerMap(mid="2")),
+        cache.state,
+        cache.merge,
         capture=lambda event, data: events.append((event, data)),
     )
 
     # The final successful call still applied despite earlier failures.
-    assert [p.as_dict() for p in state.map.areas] == [{"x": 5, "y": 6}]
+    assert [p.as_dict() for p in cache.state.map.areas] == [{"x": 5, "y": 6}]
     assert len(events) == 3
     assert all(event == "rtk_map_refresh_error" for event, _ in events)
 

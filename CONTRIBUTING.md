@@ -9,6 +9,8 @@ This repository is intentionally scoped to ECOVACS GOAT mower support. Please ke
 - Prefer MQTT push handling and grouped readbacks only for startup or stale state.
 - Do not include real device IDs, tokens, captures, LAN details, or account information in issues or pull requests.
 - Add focused tests for parser or command-shape changes.
+- Merge every command reply into the latest coordinator state (`_merge_reply`). Never hold a `MowerState` across an `await` and write it back: the mower answers map requests with MQTT pushes while the request is still pending, and a stale write erases them. `tests/ecovacs_goat_g1/test_state_merge_rules.py` checks this.
+- Keep model differences in the capability profile (`mower_profiles.py`). A fix for one mower family must not weaken another family's tests. Changes to refreshes or map requests need coordinator tests in `tests/ecovacs_goat_g1/test_mower_coordinator.py` for each family they touch.
 
 ## Releases & versioning
 
@@ -69,6 +71,8 @@ from there.
 - Workflow pushes use the default `GITHUB_TOKEN`, which does **not** re-trigger
   workflows; `[skip ci]` is an additional safeguard. Both `develop` and `main`
   must allow the token to push (branch protection bypass) for the write-backs.
+- Both publishing workflows run the reusable `tests.yml` first. A failing test
+  stops the beta or the release.
 - The dashboard card is cache-busted by a content hash of the card file (see
   `custom_components/ecovacs_goat_g1/frontend.py`), so it refreshes whenever the
   file changes — independent of the version number.
@@ -82,7 +86,7 @@ python -m compileall custom_components/ecovacs_goat_g1 tests/ecovacs_goat_g1
 
 ## Pre-commit
 
-Hooks run **gitleaks** (secrets), **semgrep** (static analysis), and **Trivy** filesystem scans in Docker, **pip-audit** on `requirements-audit.txt` (Python CVEs), plus basic whitespace fixes. **Docker** is required for those scanners (Semgrep does not publish a supported Windows wheel). Install [pre-commit](https://pre-commit.com) and Docker, then:
+Hooks run the unit tests (**pytest**, when Python files change), **gitleaks** (secrets), **semgrep** (static analysis), and **Trivy** filesystem scans in Docker, **pip-audit** on `requirements-audit.txt` (Python CVEs), plus basic whitespace fixes. **Docker** is required for those scanners (Semgrep does not publish a supported Windows wheel). Install [pre-commit](https://pre-commit.com) and Docker, then:
 
 ```bash
 pip install pre-commit

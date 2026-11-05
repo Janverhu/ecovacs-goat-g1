@@ -77,7 +77,12 @@ BASE_MAP_SETTLE_SECONDS = 15
 # - Do not live-position poll for stable paused, stopped, idle, or docked states.
 # - Gate mower-provided map trace pushes by accumulated heading change. Trace
 #   payloads are heavier than onPos; accepting them after a turn keeps completed
-#   mowing lines fresh without redrawing the full area on every trace push.
+#   mowing lines fresh without redrawing the full area on every trace push. A
+#   live-map request (keepalive or a visible card) opens the gate for the trace
+#   it asks for, as the app map screen applies every trace it requests.
+# - Merge every command reply into the latest state. Trace and base-map pieces
+#   arrive as pushes while their request is still pending; writing back a state
+#   captured before the request would drop them.
 # - The fast app-style live-position stream is requested only through the
 #   request_live_position_stream service. The custom card can start an explicit
 #   keepalive window; background mowing refreshes stay at a slow getPos cadence.
@@ -366,6 +371,11 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         super().async_set_updated_data(data)
         self._schedule_saved_map(data)
 
+    def _merge_reply(self, command: str, response: dict[str, Any]) -> MowerState:
+        """Merge a command reply into the latest state without notifying listeners."""
+        self.data = apply_response(self.data, command, response)
+        return self.data
+
     @property
     def debug_capture(self) -> DebugCaptureStore:
         """Return the shared debug capture store."""
@@ -491,7 +501,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
     async def _async_update_data(self) -> MowerState:
         """Refresh from the mower using a small app-style command set."""
         try:
-            state = await self._async_refresh_state_groups()
+            await self._async_refresh_state_groups()
             for command, payload in (
                 ("getWifiList", {}),
                 ("getLifeSpan", {}),
@@ -499,7 +509,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             ):
                 try:
                     response = await self.api.control(self.device, command, payload)
-                    state = apply_response(state, command, response)
+                    self._merge_reply(command, response)
                 except EcovacsApiError as err:
                     if self._halt_for_login_failure(err):
                         raise
@@ -520,7 +530,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 ) from err
             raise UpdateFailed(f"Unexpected ECOVACS update error: {err}") from err
 
-        return state
+        return self.data
 
     def _handle_mqtt_message(self, topic: str, payload: bytes) -> None:
         """Handle a pushed MQTT message from paho's thread."""
@@ -665,6 +675,17 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         self._last_position_heading = None
         self._last_position_path_heading = None
 
+    def _merge_trace_reply(self, response: dict[str, Any]) -> bool:
+        """Merge a getMapTrace_V2 reply and return whether the trace advanced."""
+        previous_state = self.data
+        state = apply_response(self.data, "getMapTrace_V2", response)
+        trace_changed = self._trace_path_changed(previous_state, state)
+        if trace_changed:
+            state = self._reset_live_position_segment(state)
+            self._mark_trace_mqtt_applied()
+        self.data = state
+        return trace_changed
+
     @staticmethod
     def _trace_path_changed(previous: MowerState | None, current: MowerState) -> bool:
         """Return whether the mower-provided trace path actually advanced."""
@@ -730,19 +751,14 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 "getMapTrace_V2",
                 {"mid": self.data.map.mid, "type": MAP_TRACE_TYPE},
             )
-            previous_state = self.data
-            state = apply_response(previous_state, "getMapTrace_V2", response)
-            trace_changed = self._trace_path_changed(previous_state, state)
-            if trace_changed:
-                state = self._reset_live_position_segment(state)
-                self._mark_trace_mqtt_applied()
-            self.async_set_updated_data(state)
+            trace_changed = self._merge_trace_reply(response)
+            self.async_set_updated_data(self.data)
             self._capture_event(
                 "trace_refresh_after_turn",
                 {
                     "trace_changed": trace_changed,
                     "threshold_degrees": MAP_TRACE_DIRECTION_THRESHOLD_DEGREES,
-                    "map_revision": state.map.revision,
+                    "map_revision": self.data.map.revision,
                 },
             )
         except EcovacsApiError as err:
@@ -859,8 +875,10 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             if self._has_recent_position_mqtt():
                 continue
             try:
-                state = await self._async_refresh_live_position(self.data)
-                self.async_set_updated_data(self._compact_live_position_segment(state))
+                await self._async_refresh_live_position()
+                self.async_set_updated_data(
+                    self._compact_live_position_segment(self.data)
+                )
                 self._trace_update_due = True
                 self._schedule_trace_refresh()
             except EcovacsApiError as err:
@@ -897,12 +915,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             )
             return
 
-        state = await self._async_request_live_position_stream(
-            self.data or self._base_state(),
-            reason,
-            force=force,
-        )
-        self.async_set_updated_data(self._compact_live_position_segment(state))
+        await self._async_request_live_position_stream(reason, force=force)
+        self.async_set_updated_data(self._compact_live_position_segment(self.data))
 
     def _extend_live_position_keepalive(
         self,
@@ -951,17 +965,15 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             ):
                 if self._login_is_blocked():
                     return
-                state = self.data or self._base_state()
-                if force or state.activity in LIVE_POSITION_STREAM_ACTIVITIES:
+                if force or self.data.activity in LIVE_POSITION_STREAM_ACTIVITIES:
                     try:
                         await self._async_send_app_ping(reason)
-                        state = await self._async_request_live_position_stream(
-                            state,
+                        await self._async_request_live_position_stream(
                             f"{reason}_keepalive",
                             force=force,
                         )
                         self.async_set_updated_data(
-                            self._compact_live_position_segment(state)
+                            self._compact_live_position_segment(self.data)
                         )
                     except EcovacsApiError as err:
                         if self._halt_for_login_failure(err):
@@ -1017,12 +1029,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
     ) -> None:
         """Run the app-style live map stream request and merge any readbacks."""
         try:
-            state = await self._async_request_live_position_stream(
-                self.data or self._base_state(),
-                reason,
-                force=force,
-            )
-            self.async_set_updated_data(self._compact_live_position_segment(state))
+            await self._async_request_live_position_stream(reason, force=force)
+            self.async_set_updated_data(self._compact_live_position_segment(self.data))
         except asyncio.CancelledError:
             raise
         except EcovacsApiError as err:
@@ -1039,28 +1047,26 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
 
     async def _async_request_live_position_stream(
         self,
-        state: MowerState,
         reason: str,
         *,
         force: bool = False,
-    ) -> MowerState:
+    ) -> None:
         """Ask ECOVACS for the app map view, which triggers fast onPos pushes."""
         if self._login_is_blocked():
             raise EcovacsAuthError(
                 "ECOVACS login expired; reauthentication required"
             )
-        if not force and state.activity not in LIVE_POSITION_STREAM_ACTIVITIES:
+        activity = self.data.activity
+        if not force and activity not in LIVE_POSITION_STREAM_ACTIVITIES:
             self._capture_event(
                 "live_position_stream_request_skipped",
                 {
                     "reason": reason,
                     "cause": "not_in_live_stream_activity",
-                    "activity": state.activity.value
-                    if state.activity is not None
-                    else None,
+                    "activity": activity.value if activity is not None else None,
                 },
             )
-            return state
+            return
 
         await self._async_keep_app_presence_mqtt(reason)
 
@@ -1079,17 +1085,17 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                     "min_interval_seconds": LIVE_POSITION_STREAM_REQUEST_MIN_INTERVAL_SECONDS,
                 },
             )
-            return state
+            return
 
         self._last_live_position_stream_request_at = now
-        state = await self._async_refresh_live_position(state)
-        mid = state.map.mid
+        await self._async_refresh_live_position()
+        mid = self.data.map.mid
         if not mid:
             self._capture_event(
                 "live_position_stream_request_skipped",
                 {"reason": reason, "cause": "missing_mid"},
             )
-            return state
+            return
 
         trace_changed = False
         if self._protocol.map_api_uses_v2 or self._protocol.map_trace_uses_v2:
@@ -1102,17 +1108,13 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                     )
                 if self._protocol.map_trace_uses_v2:
                     try:
-                        previous_state = state
+                        self._trace_update_due = True
                         response = await self.api.control(
                             self.device,
                             "getMapTrace_V2",
                             self._app_live_map_payload(mid, MAP_TRACE_TYPE),
                         )
-                        state = apply_response(state, "getMapTrace_V2", response)
-                        trace_changed = self._trace_path_changed(previous_state, state)
-                        if trace_changed:
-                            state = self._reset_live_position_segment(state)
-                            self._mark_trace_mqtt_applied()
+                        trace_changed = self._merge_trace_reply(response)
                     except EcovacsApiError as err:
                         if not control_command_unsupported(err):
                             raise
@@ -1165,7 +1167,6 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 "map_api_uses_v2": self._protocol.map_api_uses_v2,
             },
         )
-        return state
 
     async def _async_keep_app_presence_mqtt(self, reason: str) -> None:
         """Keep the captured official-app presence session alive for visible cards."""
@@ -1340,53 +1341,53 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         )
 
     async def _async_refresh_state_groups(self) -> MowerState:
-        """Refresh only the app-captured grouped state/settings payloads."""
+        """Merge the app-captured grouped state/settings readbacks into the latest state."""
         if self._login_is_blocked():
             raise EcovacsAuthError(
                 "ECOVACS login expired; reauthentication required"
             )
-        state = self.data or self._base_state()
         for group in self._startup_getinfo_groups():
-            state, self._protocol = await apply_resilient_getinfo_group(
+            self._protocol = await apply_resilient_getinfo_group(
                 self.api,
                 self.device,
-                state,
+                self._merge_reply,
                 group,
                 self._protocol,
             )
-        state = await self._async_refresh_live_map(state)
+        await self._async_refresh_live_map()
         self._last_readback_at = monotonic()
-        return state
+        return self.data
 
-    async def _async_refresh_live_map(self, state: MowerState) -> MowerState:
+    async def _async_refresh_live_map(self) -> None:
         """Refresh live map position and request a map trace push."""
         if self._login_is_blocked():
             raise EcovacsAuthError(
                 "ECOVACS login expired; reauthentication required"
             )
         try:
-            state = await self._async_refresh_live_position(state)
+            await self._async_refresh_live_position()
         except EcovacsApiError as err:
             if self._halt_for_login_failure(err):
                 raise
             _LOGGER.debug("ECOVACS live position refresh failed: %s", err)
-            return state
+            return
 
         if self._capability.map_dialect is MapDialect.MAP_RTK:
-            return await self._async_refresh_rtk_map(state)
+            await self._async_refresh_rtk_map()
+            return
 
-        if not state.map.mid:
-            return state
-        state = await self._async_request_base_map(state)
+        if not self.data.map.mid:
+            return
+        await self._async_request_base_map()
         if not self._protocol.map_trace_uses_v2:
-            return state
+            return
         try:
             response = await self.api.control(
                 self.device,
                 "getMapTrace_V2",
-                {"mid": state.map.mid, "type": MAP_TRACE_TYPE},
+                {"mid": self.data.map.mid, "type": MAP_TRACE_TYPE},
             )
-            state = apply_response(state, "getMapTrace_V2", response)
+            self._merge_reply("getMapTrace_V2", response)
         except EcovacsApiError as err:
             if self._halt_for_login_failure(err):
                 raise
@@ -1399,32 +1400,31 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 )
             else:
                 _LOGGER.debug("ECOVACS map trace request failed: %s", err)
-        return state
 
-    async def _async_request_base_map(self, state: MowerState) -> MowerState:
+    async def _async_request_base_map(self) -> None:
         """Ask for the lawn outline when it is missing, at most a few times per map.
 
         ``getMapTrace_V2`` being unsupported must not stop these requests. Once
         the outline is stored, or the per-map limit is reached, nothing further
         is sent.
         """
+        mid = self.data.map.mid
         if (
             not self._device_mqtt_ready
             or not self._protocol.map_api_uses_v2
-            or state.map.info.outline
-            or not state.map.mid
+            or self.data.map.info.outline
+            or not mid
         ):
-            return state
-        if self._map_info_mid != state.map.mid:
-            self._map_info_mid = state.map.mid
+            return
+        if self._map_info_mid != mid:
+            self._map_info_mid = mid
             self._map_info_requests = 0
             self._logged_incomplete_base_map = None
         if self._map_info_requests >= MAX_BASE_MAP_INFO_REQUESTS:
-            return state
+            return
         # ECOVACS HOME's GOAT map screen sends getMapInfo_V2 with type "0" only.
         # The lawn arrives afterwards as onMapInfo_V2 pieces.
         self._map_info_requests += 1
-        had_outline = bool(state.map.info.outline)
         try:
             response = await self.api.control(
                 self.device,
@@ -1435,8 +1435,9 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             if self._halt_for_login_failure(err):
                 raise
             _LOGGER.debug("ECOVACS base map request failed: %s", err)
-            return state
-        state = apply_response(state, "getMapInfo_V2", response)
+            return
+        had_outline = bool(self.data.map.info.outline)
+        state = self._merge_reply("getMapInfo_V2", response)
         if not had_outline and state.map.info.outline:
             _LOGGER.info(
                 "ECOVACS base map outline ready (%s points from %s chunks)",
@@ -1445,7 +1446,6 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             )
         elif not state.map.info.outline:
             self._schedule_base_map_settle_log()
-        return state
 
     def _schedule_base_map_settle_log(self) -> None:
         """Log one outline failure after map pieces stop arriving."""
@@ -1481,7 +1481,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             if self._base_map_settle_task is asyncio.current_task():
                 self._base_map_settle_task = None
 
-    async def _async_refresh_rtk_map(self, state: MowerState) -> MowerState:
+    async def _async_refresh_rtk_map(self) -> None:
         """Best-effort O-series (RTK) map refresh.
 
         The shared position stream refreshed above provides the live marker (and
@@ -1499,12 +1499,13 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         The orchestration lives in :func:`.mower_compat.refresh_rtk_map` so it
         can be unit-tested without a Home Assistant runtime.
         """
-        return await refresh_rtk_map(
+        await refresh_rtk_map(
             self.api,
             self.device,
-            state,
+            self.data,
+            self._merge_reply,
             capture=self._capture_event,
-            outline_body=self._next_rtk_outline_body(state),
+            outline_body=self._next_rtk_outline_body(self.data),
         )
 
     def _next_rtk_outline_body(self, state: MowerState) -> dict[str, Any] | None:
@@ -1527,12 +1528,11 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         self._map_info_requests += 1
         return dict(body)
 
-    async def _async_refresh_live_position(self, state: MowerState) -> MowerState:
+    async def _async_refresh_live_position(self) -> None:
         """Refresh the mower, charger, and beacon positions."""
-        new_state, self._protocol = await refresh_live_position(
-            self.api, self.device, state, self._protocol
+        self._protocol = await refresh_live_position(
+            self.api, self.device, self._merge_reply, self._protocol
         )
-        return new_state
 
     async def _async_refresh_live_map_after_mqtt_start(self) -> None:
         """Request live map data after MQTT has had time to subscribe."""
@@ -1543,9 +1543,8 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             if self._login_is_blocked():
                 return
             try:
-                self.async_set_updated_data(
-                    await self._async_refresh_live_map(self.data or self._base_state())
-                )
+                await self._async_refresh_live_map()
+                self.async_set_updated_data(self.data)
             except EcovacsAuthError as err:
                 self._halt_for_login_failure(err)
                 return
