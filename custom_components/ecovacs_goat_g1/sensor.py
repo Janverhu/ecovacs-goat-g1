@@ -35,6 +35,7 @@ TASK_NAMES = {
     "auto": "mowing",
     "border": "edge_mowing",
     "borderrotate": "trimming",
+    "spotArea": "zone_mowing",
 }
 
 
@@ -160,6 +161,12 @@ SENSORS: tuple[MowerSensorDescription, ...] = (
         native_unit_of_measurement=PERCENTAGE,
         entity_category=EntityCategory.DIAGNOSTIC,
         exists_fn=lambda profile: profile.has_lens_brush,
+    ),
+    MowerSensorDescription(
+        key="firmware_version",
+        name="Firmware version",
+        value_fn=lambda state: state.firmware_version,
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
     MowerSensorDescription(
         key="goat_g1_model_line",

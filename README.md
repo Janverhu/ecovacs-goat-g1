@@ -48,7 +48,7 @@ The goal is to keep communication with the mower conservative: use pushed update
 
 - Start or resume mowing, stop mowing, and return to dock.
 - A **Trim edges** button on mowers with a TrueEdge trimmer (GOAT O1200 LiDAR Pro).
-- Battery, charging, current task, error, Wi-Fi, current mow, total mow, and consumable sensors.
+- Battery, charging, current task, error, firmware, Wi-Fi, current mow, total mow, and consumable sensors.
 - Settings for rain delay, animal protection, AI recognition, edge mowing, safer mode, warning switches, cut direction, mowing efficiency, and obstacle avoidance.
 - Diagnostic model-line and feature information to help identify G1 variants.
 - Optional Lovelace card with a live map and clear mower controls.

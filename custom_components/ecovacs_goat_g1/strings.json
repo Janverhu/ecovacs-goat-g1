@@ -97,6 +97,9 @@
       "lifespan_lens_brush": {
         "name": "Lens brush lifespan"
       },
+      "firmware_version": {
+        "name": "Firmware version"
+      },
       "network_ip": {
         "name": "IP address"
       },

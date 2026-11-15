@@ -897,6 +897,110 @@ def test_clean_info_records_running_task_type() -> None:
     assert state.task_type is None
 
 
+_SCHEDULED_MOW = {
+    "trigger": "schedule",
+    "other": "",
+    "rotationPause": 0,
+    "ssid": "8",
+    "state": "clean",
+    "cleanState": {
+        "motionState": "working",
+        "content": {"type": "spotArea", "value": "1", "subContent": {"type": "spotArea"}},
+    },
+}
+
+
+def test_o_series_scheduled_mow_reports_through_schedule_task_info() -> None:
+    """The O1200 LiDAR Pro keeps getCleanInfo idle during a scheduled mow."""
+    state = apply_command_data(
+        MowerState(activity=MowerActivity.DOCKED),
+        "onScheduleTaskInfo",
+        _SCHEDULED_MOW,
+    )
+
+    assert state.activity is MowerActivity.MOWING
+    assert state.task_type == "spotArea"
+
+    state = apply_command_data(
+        state,
+        "getInfo",
+        {
+            "getCleanInfo": {"data": {"state": "idle"}, "code": 0, "msg": "ok"},
+            "getChargeState": {"code": 0, "msg": "ok", "data": {"isCharging": 0}},
+            "getScheduleTaskInfo": {"code": 10000, "msg": "fail"},
+        },
+    )
+
+    assert state.activity is MowerActivity.MOWING
+    assert state.task_type == "spotArea"
+
+    state = apply_command_data(
+        state, "onScheduleTaskInfo", {"trigger": "schedule", "state": "idle"}
+    )
+    state = apply_command_data(state, "getCleanInfo", {"state": "idle"})
+
+    assert state.activity is MowerActivity.IDLE
+    assert state.task_type is None
+    assert state.schedule_task_running is False
+
+
+def test_charging_or_an_app_job_ends_a_scheduled_mow() -> None:
+    """A missed schedule end must not hide later getCleanInfo idle replies."""
+    scheduled = apply_command_data(
+        MowerState(activity=MowerActivity.DOCKED), "onScheduleTaskInfo", _SCHEDULED_MOW
+    )
+
+    docked = apply_command_data(scheduled, "onChargeState", {"isCharging": 1})
+    docked = apply_command_data(docked, "getCleanInfo", {"state": "idle"})
+
+    assert docked.activity is MowerActivity.DOCKED
+    assert docked.schedule_task_running is False
+
+    app_job = apply_command_data(
+        scheduled,
+        "onCleanInfo",
+        {
+            "trigger": "app",
+            "state": "clean",
+            "cleanState": {"motionState": "working", "content": {"type": "auto"}},
+        },
+    )
+    app_job = apply_command_data(app_job, "onCleanInfo", {"trigger": "app", "state": "idle"})
+
+    assert app_job.activity is MowerActivity.IDLE
+    assert app_job.task_type is None
+
+
+def test_get_ota_reports_the_firmware_version() -> None:
+    state = apply_command_data(
+        MowerState(),
+        "getInfo",
+        {
+            "getOta": {
+                "code": 0,
+                "msg": "ok",
+                "data": {"status": "idle", "progress": 0, "ver": "1.36.208"},
+            }
+        },
+    )
+
+    assert state.firmware_version == "1.36.208"
+
+
+def test_o800_charge_start_places_the_dock() -> None:
+    """The O800 RTK marks getPos chargePos invalid but sends chargerPos on docking."""
+    state = apply_command_data(
+        MowerState(activity=MowerActivity.RETURNING),
+        "onFwBuryPoint-bd_task-charge-start",
+        {"battery": 94, "chargerPos": "0,0", "voltage": 19610},
+    )
+
+    assert [point.as_dict() for point in state.map.charge_positions] == [
+        {"x": 0, "y": 0}
+    ]
+    assert state.map.current_position is None
+
+
 def test_o_series_map_info_diagonal_steps() -> None:
     """Odd digits are the diagonals, clockwise from north-west."""
     state = apply_command_data(

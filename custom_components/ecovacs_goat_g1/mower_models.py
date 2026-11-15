@@ -301,6 +301,8 @@ class MowerState:
     activity: MowerActivity = MowerActivity.UNKNOWN
     task_id: str | None = None
     task_type: str | None = None
+    schedule_task_running: bool = False
+    firmware_version: str | None = None
     battery: int | None = None
     charging: bool | None = None
     charge_mode: str | None = None

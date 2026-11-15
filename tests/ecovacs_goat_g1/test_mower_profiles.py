@@ -91,6 +91,17 @@ def test_only_the_lidar_pro_has_an_edge_trimmer() -> None:
         assert profile.clean_body("pause", "borderrotate") == profile.clean_body("pause")
 
 
+def test_only_the_o_series_reads_scheduled_jobs_separately() -> None:
+    assert profile_for_model("GOAT O1200 LiDAR Pro").schedule_info_command == (
+        "getScheduleTaskInfo"
+    )
+    assert profile_for_model("GOAT O800 RTK").schedule_info_command == (
+        "getScheduleTaskInfo"
+    )
+    assert profile_for_model("ECOVACS GOAT G1-800").schedule_info_command is None
+    assert profile_for_model("Something Else").schedule_info_command is None
+
+
 def test_lens_brush_is_a_g1_line_part() -> None:
     assert profile_for_model("ECOVACS GOAT G1-800").has_lens_brush is True
     assert profile_for_model("Something Else").has_lens_brush is True
