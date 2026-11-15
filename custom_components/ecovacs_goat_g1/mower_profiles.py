@@ -50,6 +50,8 @@ from .goat_g1_models import (
 )
 
 EDGE_TRIM_TASK_TYPE = "borderrotate"
+# The app asks an edge-trimming mower for these consumables by name.
+EDGE_TRIM_LIFESPAN_TYPES = ("blade", "weedRope", "trimmerBrush")
 # The app sent this value when starting a trim on a single-lawn map.
 _EDGE_TRIM_START_VALUE = "reid:1"
 _EDGE_TRIM_VARIANTS = frozenset({VARIANT_O1200_LIDAR_PRO})

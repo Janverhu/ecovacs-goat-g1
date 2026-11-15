@@ -20,6 +20,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .debug_capture import DebugCaptureStore
 from .goat_g1_models import classify_goat_g1_variant
 from .mower_profiles import (
+    EDGE_TRIM_LIFESPAN_TYPES,
     EDGE_TRIM_TASK_TYPE,
     CapabilityProfile,
     MapDialect,
@@ -511,11 +512,14 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         """Refresh from the mower using a small app-style command set."""
         try:
             await self._async_refresh_state_groups()
-            for command, payload in (
+            reads: list[tuple[str, Any]] = [
                 ("getWifiList", {}),
                 ("getLifeSpan", {}),
                 ("getTotalStats", {}),
-            ):
+            ]
+            if self._capability.edge_trim:
+                reads.append(("getLifeSpan", list(EDGE_TRIM_LIFESPAN_TYPES)))
+            for command, payload in reads:
                 try:
                     response = await self.api.control(self.device, command, payload)
                     self._merge_reply(command, response)

@@ -84,6 +84,14 @@ of the current lane, or a bare `1;1;<id>` once it is done. Its `onPos`
 pushes arrive more than once a second while mowing, so the integration draws
 the mowed path from those positions and keeps the whole mow.
 
+O-series `getScheduleLatestTask` / `onScheduleLatestTask` list the upcoming
+scheduled mows as `task` entries with `sDay` (weekday, Monday `1`), `sTime`,
+`eDay` and `eTime`, nearest first. The G1 answers with a different
+`{channel, workType, status, mow}` shape. The app asks the O1200 LiDAR Pro for
+`getLifeSpan` `["blade","weedRope","trimmerBrush"]` by name. Error codes
+`401`-`435` follow the app's alert texts; `403` and `430`-`435` are sensor
+faults.
+
 The O1200 LiDAR Pro reports a scheduled mow only through `onScheduleTaskInfo`
 / `getScheduleTaskInfo`, with the `getCleanInfo` fields (`trigger` `schedule`,
 `cleanState.content.type` `spotArea`). Its `getCleanInfo` stays `idle` for

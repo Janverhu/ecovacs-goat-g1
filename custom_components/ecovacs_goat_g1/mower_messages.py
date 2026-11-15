@@ -20,6 +20,7 @@ from .mower_models import (
     MowerState,
     MowerStats,
     NetworkInfo,
+    ScheduleSlot,
 )
 
 MOWING_EFFICIENCY_OPTIONS = ("quick", "delicate")
@@ -35,10 +36,37 @@ OBSTACLE_AVOIDANCE_BY_LEVEL = {
 OBSTACLE_AVOIDANCE_LEVELS = {
     value: key for key, value in OBSTACLE_AVOIDANCE_BY_LEVEL.items()
 }
+# 401-435 follow the GOAT app's English alert texts.
 ERROR_DESCRIPTIONS = {
     0: "NoError: Robot is operational",
     100: "NoError: Robot is operational",
+    401: "Robot tilted. Place it on flat ground.",
+    402: "Robot lifted. Place it back on the ground.",
+    404: "Battery malfunction. Please check.",
+    405: "Left rear wheel fault. Please check.",
+    406: "Cutting system blocked. Please check.",
+    407: "Bumper fault. Please check.",
+    408: "Robot trapped. Give it a hand.",
+    409: "Unable to clean the camera. Please check.",
+    410: "Robot lost. Please check.",
+    411: "Station location fault. Please check.",
+    412: "Navigation beacon signal fault. Please check.",
+    413: "Open the panoramic camera cover.",
+    414: "Front AI camera and ToF sensor are dirty.",
+    415: "Panoramic camera is dirty. Wipe it clean.",
+    416: "High battery temperature.",
+    417: "Low battery temperature.",
+    418: "Robot entered a no-entry zone. Move it away now.",
+    419: "Robot lifted. Theft alert. Please check now.",
+    420: "Off map. Theft alert. Please check now.",
+    421: "No navigation beacon signal. Please check.",
     422: "Weak signal, back to station",
+    423: "Weak signal.",
+    424: "Right rear wheel fault. Please check.",
+    **{
+        code: f"Sensor fault ({code}). Please check."
+        for code in (403, 430, 431, 432, 433, 434, 435)
+    },
     4200: "Robot not reachable",
     500: "Request Timeout",
 }
@@ -164,6 +192,13 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
             ):
                 state = replace(
                     _apply_clean_info(state, data), schedule_task_running=False
+                )
+        case "getScheduleLatestTask" | "onScheduleLatestTask":
+            # O-series lists the upcoming scheduled mows here. The G1 replies
+            # with a different shape and is left alone.
+            if isinstance(data, dict) and isinstance(data.get("task"), list):
+                state = replace(
+                    state, upcoming_schedule=_schedule_slots(data["task"])
                 )
         case "getScheduleTaskInfo" | "onScheduleTaskInfo":
             if isinstance(data, dict) and "state" in data:
@@ -480,6 +515,27 @@ def _apply_clean_info(state: MowerState, data: dict[str, Any]) -> MowerState:
         task_type=_task_type(data) if "state" in data else state.task_type,
         map=mower_map,
     )
+
+
+def _schedule_slots(tasks: list[Any]) -> tuple[ScheduleSlot, ...]:
+    """Parse getScheduleLatestTask entries into weekly slots.
+
+    ``sDay`` is the weekday with Monday 1 (Friday is 5 and Tuesday 2 in the
+    captures). Sunday is taken as either 0 or 7.
+    """
+    slots = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        day = _int(task.get("sDay"))
+        try:
+            start = normalise_time(task.get("sTime"))
+        except ValueError:
+            continue
+        if day is None or not 0 <= day <= 7 or not start:
+            continue
+        slots.append(ScheduleSlot(weekday=day or 7, start=start))
+    return tuple(slots)
 
 
 def _job_running(data: dict[str, Any]) -> bool:

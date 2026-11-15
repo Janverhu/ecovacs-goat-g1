@@ -582,6 +582,30 @@ async def test_live_path_is_trimmed_only_when_the_mower_sends_a_trace(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "asks_for_trimmer"),
+    [
+        ("GOAT O1200 LiDAR Pro", True),
+        ("GOAT O800 RTK", False),
+        ("GOAT G1-800", False),
+    ],
+)
+async def test_trimmer_lifespans_are_requested_by_name(
+    model: str, asks_for_trimmer: bool
+) -> None:
+    """The app asks an edge-trimming mower for weedRope and trimmerBrush."""
+    api = FakeApi()
+    coordinator = _coordinator(api, MowerState(), model=model)
+
+    await coordinator._async_update_data()
+
+    lifespan_requests = [body for command, body in api.payloads if command == "getLifeSpan"]
+    assert lifespan_requests[0] == {}
+    assert (["blade", "weedRope", "trimmerBrush"] in lifespan_requests) is asks_for_trimmer
+    await coordinator.async_stop()
+
+
+@pytest.mark.asyncio
 async def test_edge_trim_is_refused_without_a_trimmer() -> None:
     api = FakeApi()
     coordinator = _coordinator(api, MowerState(), model="GOAT O800 RTK")

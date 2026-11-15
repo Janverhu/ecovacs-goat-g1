@@ -1,5 +1,6 @@
 """Tests for ECOVACS mower message parsing."""
 
+from datetime import UTC, datetime
 from pathlib import Path
 import sys
 import types
@@ -29,6 +30,8 @@ from custom_components.ecovacs_goat_g1.mower_models import (
     MowerMapInfo,
     MowerMapTrace,
     MowerState,
+    ScheduleSlot,
+    next_schedule_start,
 )
 from custom_components.ecovacs_goat_g1.mower_api import (
     EcovacsApiError,
@@ -969,6 +972,62 @@ def test_charging_or_an_app_job_ends_a_scheduled_mow() -> None:
 
     assert app_job.activity is MowerActivity.IDLE
     assert app_job.task_type is None
+
+
+def test_error_codes_carry_the_app_alert_text() -> None:
+    blocked = apply_command_data(MowerState(), "onError", {"code": [406]})
+    sensor = apply_command_data(MowerState(), "onError", {"code": [433]})
+
+    assert blocked.error_description == "Cutting system blocked. Please check."
+    assert sensor.error_description == "Sensor fault (433). Please check."
+    assert blocked.activity is MowerActivity.ERROR
+
+
+def test_o_series_schedule_lists_the_upcoming_mows() -> None:
+    """getScheduleLatestTask sDay is the weekday with Monday 1."""
+    state = apply_command_data(
+        MowerState(),
+        "getInfo",
+        {
+            "getScheduleLatestTask": {
+                "code": 0,
+                "msg": "ok",
+                "data": {
+                    "task": [
+                        {"ssid": "8", "sDay": 5, "eDay": 5, "sTime": "17:00", "eTime": "19:00"},
+                        {"ssid": "9", "sDay": 0, "sTime": "9:5"},
+                        {"ssid": "x", "sDay": 9, "sTime": "10:00"},
+                    ]
+                },
+            }
+        },
+    )
+
+    assert state.upcoming_schedule == (
+        ScheduleSlot(weekday=5, start="17:00"),
+        ScheduleSlot(weekday=7, start="09:05"),
+    )
+
+    g1 = apply_command_data(
+        state,
+        "onScheduleLatestTask",
+        {"channel": "get", "workType": "", "status": 0, "mow": []},
+    )
+
+    assert g1.upcoming_schedule == state.upcoming_schedule
+
+
+def test_next_schedule_start_picks_the_nearest_weekly_slot() -> None:
+    slots = (ScheduleSlot(weekday=5, start="17:00"), ScheduleSlot(weekday=3, start="16:00"))
+    friday_afternoon = datetime(2026, 11, 6, 16, 56, tzinfo=UTC)
+
+    assert next_schedule_start(slots, friday_afternoon) == datetime(
+        2026, 11, 6, 17, 0, tzinfo=UTC
+    )
+    assert next_schedule_start(slots, friday_afternoon.replace(hour=17, minute=0)) == (
+        datetime(2026, 11, 11, 16, 0, tzinfo=UTC)
+    )
+    assert next_schedule_start((), friday_afternoon) is None
 
 
 def test_get_ota_reports_the_firmware_version() -> None:
