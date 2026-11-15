@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 from typing import Any
 
 import voluptuous as vol
@@ -209,26 +210,29 @@ def _async_register_services(hass: HomeAssistant) -> None:
     async def async_start_debug_capture(call: ServiceCall) -> None:
         """Start debug captures for matching config entries."""
         for controller in _controllers_for_call(hass, call):
-            controller.debug_capture.start(
-                reason=call.data.get("reason"),
-                include_raw_payloads=call.data.get("include_raw_payloads"),
-                max_duration_seconds=call.data.get("duration_minutes", 0) * 60
-                if "duration_minutes" in call.data
-                else None,
-                max_bytes=call.data.get("max_size_mb", 0) * 1024 * 1024
-                if "max_size_mb" in call.data
-                else None,
+            await hass.async_add_executor_job(
+                partial(
+                    controller.debug_capture.start,
+                    reason=call.data.get("reason"),
+                    include_raw_payloads=call.data.get("include_raw_payloads"),
+                    max_duration_seconds=call.data.get("duration_minutes", 0) * 60
+                    if "duration_minutes" in call.data
+                    else None,
+                    max_bytes=call.data.get("max_size_mb", 0) * 1024 * 1024
+                    if "max_size_mb" in call.data
+                    else None,
+                )
             )
 
     async def async_stop_debug_capture(call: ServiceCall) -> None:
         """Stop debug captures for matching config entries."""
         for controller in _controllers_for_call(hass, call):
-            controller.debug_capture.stop()
+            await hass.async_add_executor_job(controller.debug_capture.stop)
 
     async def async_clear_debug_capture(call: ServiceCall) -> None:
         """Clear debug captures for matching config entries."""
         for controller in _controllers_for_call(hass, call):
-            controller.debug_capture.clear()
+            await hass.async_add_executor_job(controller.debug_capture.clear)
 
     async def async_mark_debug_capture(call: ServiceCall) -> None:
         """Add a marker to active debug captures."""
@@ -239,7 +243,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
         """Export the latest debug capture as a local zip file."""
         try:
             exports = [
-                controller.debug_capture.export_zip(call.data.get("session_id"))
+                await hass.async_add_executor_job(
+                    controller.debug_capture.export_zip, call.data.get("session_id")
+                )
                 for controller in _controllers_for_call(hass, call)
             ]
         except FileNotFoundError as err:

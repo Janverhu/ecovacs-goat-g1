@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
 from homeassistant.components.persistent_notification import async_create, async_dismiss
 from homeassistant.const import EntityCategory
@@ -103,13 +105,22 @@ class MowerButton(EcovacsMowerEntity, ButtonEntity):
                 except EcovacsApiError as err:
                     raise HomeAssistantError(f"Mower rejected edge trim: {err}") from err
             case "start_debug_capture":
-                self.coordinator.debug_capture.start(reason="Started from Home Assistant UI")
+                await self.hass.async_add_executor_job(
+                    partial(
+                        self.coordinator.debug_capture.start,
+                        reason="Started from Home Assistant UI",
+                    )
+                )
                 self.coordinator.async_set_updated_data(self.coordinator.data)
             case "stop_debug_capture":
-                self.coordinator.debug_capture.stop()
+                await self.hass.async_add_executor_job(
+                    self.coordinator.debug_capture.stop
+                )
                 self.coordinator.async_set_updated_data(self.coordinator.data)
             case "export_debug_capture":
-                export = self.coordinator.debug_capture.export_zip()
+                export = await self.hass.async_add_executor_job(
+                    self.coordinator.debug_capture.export_zip
+                )
                 base_url = (
                     self.coordinator.hass.config.external_url
                     or self.coordinator.hass.config.internal_url
@@ -131,7 +142,9 @@ class MowerButton(EcovacsMowerEntity, ButtonEntity):
                 )
                 self.coordinator.async_set_updated_data(self.coordinator.data)
             case "clear_debug_capture":
-                self.coordinator.debug_capture.clear()
+                await self.hass.async_add_executor_job(
+                    self.coordinator.debug_capture.clear
+                )
                 async_dismiss(
                     self.coordinator.hass,
                     notification_id="ecovacs_goat_debug_capture_export",
