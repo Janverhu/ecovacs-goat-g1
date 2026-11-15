@@ -91,23 +91,24 @@ The custom card is optional, but recommended. It exposes a clear stop button and
 
 **No manual install is needed.** The integration bundles the card and serves `ecovacs-goat-card.js` from the integration. On a storage-mode dashboard, setup adds a **module** resource for that file under **Settings → Dashboards → Resources**, so Lovelace loads the card before it creates cards. The resource URL includes a content hash of the card file (`?v=`), and setup updates that resource when the file changes. When dashboard resources are YAML-only, setup loads the same URL as an extra frontend module.
 
-Just add **Ecovacs GOAT Card** from the custom card picker (you may need to reload the dashboard once after first install).
+Just add **Ecovacs GOAT Card** from the custom card picker (you may need to reload the dashboard once after first install). The card finds your GOAT mower and the map, battery, error and other sensors on its device by itself, whatever the mower is called. With more than one GOAT mower, set `entity` to pick one. Any option you set yourself, such as `map_entity`, overrides what the card finds.
 
 > **Upgrading from a manual install (do this):** if you previously added a `/local/ecovacs_goat/ecovacs-goat-card.js` Lovelace resource, **remove it** in **Settings -> Dashboards -> Resources**, then hard-refresh your browser (Ctrl+Shift+R / Cmd+Shift+R). This is required: a dashboard card can only be registered once, and the old manual resource has no version in its URL, so your browser keeps loading the **cached old card** and never picks up the bundled one. You can also delete the copied `config/www/ecovacs_goat/ecovacs-goat-card.js` file.
 
 The card’s **keepalive** control starts a timed **`request_live_position_stream`** session so the mower behaves as if the official app map is open (MQTT-heavy updates). How that fits with the trace outline and the 60 second fallback is explained under **How It Behaves** below.
 
-Example YAML:
+Example YAML. Only `type` is required; the other lines override what the card finds:
 
 ```yaml
 type: custom:ecovacs-goat-card
 entity: lawn_mower.mower
+map_entity: sensor.mower_live_map
 battery_entity: sensor.mower_battery_level
 error_entity: sensor.mower_error
 area_entity: sensor.mower_mowing_area
 progress_entity: sensor.mower_mowing_progress
 direction_entity: number.mower_cut_direction
-stop_button: button.mower_end_mowing
+stop_button: button.mower_stop_mowing
 name: Mower
 ```
 

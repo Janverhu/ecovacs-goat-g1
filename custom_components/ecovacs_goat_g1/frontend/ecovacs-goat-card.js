@@ -3,7 +3,8 @@
  * -----------------
  * No-build Lovelace card for the ECOVACS GOAT mower integration.
  *
- * YAML usage:
+ * YAML usage (every option is optional; the card finds the GOAT mower and the
+ * sensors on its device by themselves, and a value set here wins):
  *   type: custom:ecovacs-goat-card
  *   entity: lawn_mower.mower
  *   battery_entity: sensor.mower_battery_level
@@ -12,7 +13,7 @@
  *   error_entity: sensor.mower_error
  *   map_entity: sensor.mower_live_map
  *   direction_entity: number.mower_cut_direction
- *   stop_button: button.mower_end_mowing
+ *   stop_button: button.mower_stop_mowing
  */
 
 const DEFAULT_CONFIG = {
@@ -26,6 +27,19 @@ const DEFAULT_CONFIG = {
   direction_entity: "number.mower_cut_direction",
   stop_button: "button.mower_end_mowing",
   name: "Mower",
+};
+
+const INTEGRATION_DOMAIN = "ecovacs_goat_g1";
+// Entity ids follow "<device>_<name>", so the ending finds each sensor on the
+// mower's device. The stop button was named "End mowing" before "Stop mowing".
+const ROLE_ENTITY_ENDINGS = {
+  battery_entity: ["sensor", ["_battery_level"]],
+  area_entity: ["sensor", ["_mowing_area"]],
+  progress_entity: ["sensor", ["_mowing_progress"]],
+  error_entity: ["sensor", ["_error"]],
+  map_entity: ["sensor", ["_live_map"]],
+  direction_entity: ["number", ["_cut_direction"]],
+  stop_button: ["button", ["_stop_mowing", "_end_mowing"]],
 };
 
 const CARD_FORMAT_VERSION = "rounded-summary-v2";
@@ -419,12 +433,22 @@ class EcovacsGoatCard extends HTMLElement {
     }
   }
 
+  static getStubConfig(hass) {
+    const mower = Object.values(hass?.entities || {}).find(
+      (entry) => entry.platform === INTEGRATION_DOMAIN && entry.entity_id.startsWith("lawn_mower.")
+    );
+    return mower ? { entity: mower.entity_id } : {};
+  }
+
   setConfig(config) {
+    this._userConfig = { ...config };
+    this._resolvedRegistry = undefined;
     this.config = { ...DEFAULT_CONFIG, ...config };
   }
 
   set hass(hass) {
     this._hass = hass;
+    this._resolveEntities();
     this._loadStaticMap();
     this._checkPendingOutcome();
     if (!this.config || !this.querySelector("ha-card")) {
@@ -564,6 +588,41 @@ class EcovacsGoatCard extends HTMLElement {
 
   _state(entityId) {
     return entityId ? this._hass.states[entityId] : undefined;
+  }
+
+  _resolveEntities() {
+    const registry = this._hass?.entities;
+    if (!this._userConfig || !registry || registry === this._resolvedRegistry) {
+      return;
+    }
+    this._resolvedRegistry = registry;
+    const entries = Object.values(registry).filter(
+      (entry) => entry.platform === INTEGRATION_DOMAIN
+    );
+    const resolved = { ...DEFAULT_CONFIG };
+    resolved.entity =
+      this._userConfig.entity ||
+      (this._hass.states[DEFAULT_CONFIG.entity] ? DEFAULT_CONFIG.entity : undefined) ||
+      entries.find((entry) => entry.entity_id.startsWith("lawn_mower."))?.entity_id ||
+      DEFAULT_CONFIG.entity;
+    const deviceId = registry[resolved.entity]?.device_id;
+    if (deviceId) {
+      const ownEntries = entries.filter((entry) => entry.device_id === deviceId);
+      for (const [role, [domain, endings]] of Object.entries(ROLE_ENTITY_ENDINGS)) {
+        const match = endings
+          .map((ending) =>
+            ownEntries.find(
+              (entry) =>
+                entry.entity_id.startsWith(`${domain}.`) && entry.entity_id.endsWith(ending)
+            )
+          )
+          .find(Boolean);
+        if (match) {
+          resolved[role] = match.entity_id;
+        }
+      }
+    }
+    this.config = { ...resolved, ...this._userConfig };
   }
 
   _displayState(actualState) {
