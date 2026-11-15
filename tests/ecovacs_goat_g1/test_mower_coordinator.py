@@ -184,16 +184,50 @@ def _lawn_pushes(batch: str, points: list[tuple[int, int]]) -> list[tuple[str, d
     ]
 
 
-def _rtk_lawn_pushes(batch: str, chain: str) -> list[tuple[str, dict]]:
+def _rtk_lawn_pushes(
+    batch: str, chain: str, mid: str = MID
+) -> list[tuple[str, dict]]:
     pieces = _info_pieces([["1", f"s1;1;0,0;{chain}"], ["2", "1"]])
     return [
         (
             "onMI",
-            {"mid": MID, "batid": batch, "serial": len(pieces), "type": "0",
+            {"mid": mid, "batid": batch, "serial": len(pieces), "type": "0",
              "using": 1, "index": index, "info": info},
         )
         for index, info in enumerate(pieces)
     ]
+
+
+def _o800_trace_pushes(
+    batch: str, points: list[tuple[int, int]]
+) -> list[tuple[str, dict]]:
+    pieces = _info_pieces([["1", "-1662072064;"], ["2"], ["3", _coordinates(points)]])
+    return [
+        (
+            "onMapTrace",
+            {"mid": "123456789", "batid": batch, "serial": len(pieces), "type": "0",
+             "index": index, "info": info},
+        )
+        for index, info in enumerate(pieces)
+    ]
+
+
+def _position(heading: int) -> tuple[str, dict]:
+    return (
+        "onPos",
+        {
+            "deebotPos": {"x": 120, "y": 180, "a": heading, "invalid": 0},
+            "chargePos": [{"x": 0, "y": 0, "a": 0, "t": 1, "invalid": 1}],
+            "mid": "0",
+        },
+    )
+
+
+def _push(coordinator: MowerCoordinator, command: str, data: dict) -> None:
+    message = json.dumps({"header": {"ts": 1}, "body": {"data": data}})
+    coordinator._handle_mqtt_message(
+        f"iot/atr/{command}/did/class/resource/j", message.encode()
+    )
 
 
 def _points(path: tuple[MapPosition, ...]) -> list[tuple[int, int]]:
@@ -227,15 +261,14 @@ class FakeApi:
         self.coordinator: MowerCoordinator | None = None
         self.pushes: dict[str, list[tuple[str, dict]]] = {}
         self.commands: list[str] = []
+        self.payloads: list[tuple[str, Any]] = []
 
-    async def control(self, _device: MowerDevice, command: str, _payload: Any) -> dict:
+    async def control(self, _device: MowerDevice, command: str, payload: Any) -> dict:
         self.commands.append(command)
+        self.payloads.append((command, payload))
         assert self.coordinator is not None
         for push_command, data in self.pushes.get(command, ()):
-            message = json.dumps({"header": {"ts": 1}, "body": {"data": data}})
-            self.coordinator._handle_mqtt_message(
-                f"iot/atr/{push_command}/did/class/resource/j", message.encode()
-            )
+            _push(self.coordinator, push_command, data)
         await asyncio.sleep(0)
         if command == "getPos":
             return GET_POS_REPLY
@@ -363,4 +396,109 @@ async def test_o_series_readback_keeps_lawn_pieces_pushed_during_later_requests(
     assert api.commands.index("getMI") < api.commands.index("getMapTrack")
     assert "getMapTrace_V2" not in api.commands
     assert _points(coordinator.data.map.info.outline) == RTK_LAWN
+    await coordinator.async_stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["GOAT O800 RTK", "GOAT O1200 LiDAR Pro"])
+async def test_o_series_lawn_survives_positions_with_another_map_id(model: str) -> None:
+    """onMI says mid 1 while onPos says mid 0, so onMI must not own the map id.
+
+    Otherwise every position push looks like a remap and clears the lawn.
+    """
+    api = FakeApi()
+    coordinator = _coordinator(api, MowerState(), model=model)
+
+    for command, data in (
+        _position(0),
+        *_rtk_lawn_pushes("lawn", RTK_LAWN_CHAIN, mid="1"),
+        _position(0),
+    ):
+        _push(coordinator, command, data)
+    await asyncio.sleep(0)
+
+    assert coordinator.data.map.mid == "0"
+    assert _points(coordinator.data.map.info.outline) == RTK_LAWN
+    await coordinator.async_stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "trace_pushes"),
+    [("GOAT G1-800", _trace_pushes), ("GOAT O800 RTK", _o800_trace_pushes)],
+)
+async def test_mowed_path_pushes_wait_for_a_turn(
+    model: str,
+    trace_pushes: Any,
+) -> None:
+    """After the first path, a path push is applied once the mower has turned."""
+    api = FakeApi()
+    coordinator = _coordinator(
+        api,
+        MowerState(activity=MowerActivity.MOWING, map=MowerMap(mid="0")),
+        model=model,
+    )
+    first = TRACE[:2]
+
+    for command, data in trace_pushes("first", first):
+        _push(coordinator, command, data)
+    await asyncio.sleep(0)
+    assert _points(coordinator.data.map.trace.path) == first
+
+    for command, data in trace_pushes("straight", TRACE):
+        _push(coordinator, command, data)
+    await asyncio.sleep(0)
+    assert _points(coordinator.data.map.trace.path) == first
+
+    for command, data in (
+        _position(0),
+        _position(120),
+        *trace_pushes("turned", TRACE),
+    ):
+        _push(coordinator, command, data)
+    await asyncio.sleep(0)
+    assert _points(coordinator.data.map.trace.path) == TRACE
+    await coordinator.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_edge_trim_sends_borderrotate_until_it_ends() -> None:
+    """A trim is paused, resumed and stopped by type; the next mow is auto again."""
+    api = FakeApi()
+    coordinator = _coordinator(
+        api,
+        MowerState(activity=MowerActivity.DOCKED),
+        model="GOAT O1200 LiDAR Pro",
+    )
+    coordinator._last_readback_at = mower_coordinator.monotonic()
+
+    await coordinator.start_edge_trim()
+    assert coordinator.data.activity is MowerActivity.MOWING
+    assert coordinator.data.task_type == "borderrotate"
+    await coordinator.pause()
+    await coordinator.start_mowing()
+    await coordinator.end_mowing()
+    assert coordinator.data.task_type is None
+    await coordinator.start_mowing()
+
+    assert [body for command, body in api.payloads if command == "clean"] == [
+        {"act": "start", "content": {"type": "borderrotate", "value": "reid:1"}},
+        {"act": "pause", "content": {"type": "borderrotate"}},
+        {"act": "resume", "content": {"type": "borderrotate"}},
+        {"act": "stop", "content": {"type": "borderrotate"}},
+        {"act": "start", "content": {"type": "auto"}},
+    ]
+    assert coordinator.data.task_type == "auto"
+    await coordinator.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_edge_trim_is_refused_without_a_trimmer() -> None:
+    api = FakeApi()
+    coordinator = _coordinator(api, MowerState(), model="GOAT O800 RTK")
+
+    with pytest.raises(mower_coordinator.HomeAssistantError):
+        await coordinator.start_edge_trim()
+
+    assert api.commands == []
     await coordinator.async_stop()

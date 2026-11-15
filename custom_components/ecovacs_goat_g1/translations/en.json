@@ -63,6 +63,11 @@
     }
   },
   "entity": {
+    "binary_sensor": {
+      "charging": {
+        "name": "Charging"
+      }
+    },
     "number": {
       "cut_direction": {
         "name": "Cut direction"
@@ -74,6 +79,9 @@
     "sensor": {
       "battery_level": {
         "name": "Battery level"
+      },
+      "current_task": {
+        "name": "Current task"
       },
       "error": {
         "name": "Error",
@@ -185,6 +193,9 @@
       },
       "refresh_state": {
         "name": "Refresh state"
+      },
+      "trim_edges": {
+        "name": "Trim edges"
       },
       "start_debug_capture": {
         "name": "Start debug capture"

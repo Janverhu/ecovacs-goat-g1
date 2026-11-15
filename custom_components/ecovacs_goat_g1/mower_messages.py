@@ -183,6 +183,7 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
                     activity=activity,
                     charging=False if activity is MowerActivity.MOWING else state.charging,
                     task_id=_task_id(data, state.task_id),
+                    task_type=_task_type(data),
                     map=mower_map,
                 )
         case "onWorkState" | "getWorkState":
@@ -272,7 +273,9 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
         case "getUWB" | "onUWB":
             if isinstance(data, dict):
                 state = replace(state, map=_map_uwb_data(state.map, data))
-        case "getMapTrace_V2" | "onMapTrace_V2":
+        case "getMapTrace_V2" | "onMapTrace_V2" | "onMapTrace":
+            # The O800 RTK pushes onMapTrace with the same chunk fields. Its
+            # mowed path is the point list in layer "3".
             if isinstance(data, dict):
                 state = replace(state, map=_map_trace_data(state.map, data))
         case "getMapInfo_V2" | "onMapInfo_V2":
@@ -287,14 +290,13 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
                 state = replace(state, map=_map_set_layer(state.map, data))
         case "getMI" | "onMI":
             # O-series base map. The lawn arrives as onMI pieces with the same
-            # chunk fields as onMapInfo_V2, but the boundary is a chain code.
-            if isinstance(data, dict):
-                mower_map = _map_mid_only(state.map, data)
-                if "info" in data:
-                    mower_map = _map_info_data(
-                        mower_map, data, decode=_decode_rtk_base_map
-                    )
-                state = replace(state, map=mower_map)
+            # chunk fields as onMapInfo_V2. onMI says mid "1" while getPos/onPos
+            # say "0" on the same mower, so it must not set the active map id.
+            if isinstance(data, dict) and "info" in data:
+                state = replace(
+                    state,
+                    map=_map_info_data(state.map, data, decode=_decode_rtk_base_map),
+                )
         case (
             "getMapState"
             | "onMapState"
@@ -501,6 +503,18 @@ def _task_id(data: dict[str, Any], current: str | None) -> str | None:
             if value not in (None, ""):
                 return str(value)
     return current
+
+
+def _task_type(data: dict[str, Any]) -> str | None:
+    """Return the running job's ``cleanState.content.type``.
+
+    ``auto`` is a normal mow, ``border`` an edge mow and ``borderrotate`` a
+    TrueEdge trim. A reply without ``cleanState`` means no job is running.
+    """
+    clean_state = data.get("cleanState")
+    content = clean_state.get("content") if isinstance(clean_state, dict) else None
+    task_type = content.get("type") if isinstance(content, dict) else None
+    return str(task_type) if task_type else None
 
 
 def _work_state_activity(data: dict[str, Any], current: MowerActivity) -> MowerActivity:
@@ -1020,8 +1034,8 @@ def _decode_rtk_base_map(
 ) -> tuple[tuple[MapPosition, ...], tuple[tuple[MapPosition, ...], ...]]:
     """Decode an O-series onMI base map into the lawn outline.
 
-    Layer ``1`` holds one ``s<n>;<flag>;<x>,<y>;<chain>`` string per boundary.
-    The card draws one outline, so the largest boundary wins.
+    Layer ``1`` holds one string per boundary. The card draws one outline, so
+    the largest boundary wins.
     """
     try:
         payload = _decode_lzma_json_chunks(chunks)
@@ -1037,10 +1051,21 @@ def _decode_rtk_base_map(
             continue
         for boundary in item[1:]:
             if isinstance(boundary, str):
-                positions = _chain_boundary(boundary)
+                positions = _rtk_boundary(boundary)
                 if len(positions) >= 3:
                     boundaries.append(positions)
     return max(boundaries, key=len, default=()), ()
+
+
+def _rtk_boundary(value: str) -> tuple[MapPosition, ...]:
+    """Return the corner points of one onMI boundary.
+
+    The O1200 LiDAR Pro sends ``s<n>;<flag>;<x>,<y>;<chain>``. The O800 RTK
+    sends ``s<n>;<x>,<y>;<x>,<y>;...`` and lists every point.
+    """
+    if "," in value.rstrip(";").rsplit(";", 1)[-1]:
+        return _positions_from_coordinate_string(value)
+    return _chain_boundary(value)
 
 
 def _chain_boundary(value: str) -> tuple[MapPosition, ...]:

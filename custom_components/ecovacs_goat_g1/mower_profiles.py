@@ -25,15 +25,18 @@ the ``getCleanInfo`` *status fields* (``state`` / ``cleanState.motionState`` /
 ``trigger`` / ``cid``) are shared, so the existing status parser handles both.
 
 The O-series lawn outline arrives as ``onMI`` pushes and decodes from a
-direction chain (validated on an O1200 LiDAR Pro). ``getAreaSet`` decodes to
-area anchors. The ``getMI`` request body that triggers the push is not captured
-yet, so the coordinator tries candidate bodies while the outline is missing.
-O-series support remains **experimental / best-effort**.
+direction chain (O1200 LiDAR Pro) or a point list (O800 RTK). ``getAreaSet``
+decodes to area anchors. The ``getMI`` request body that triggers the push is
+not captured yet, so the coordinator tries candidate bodies while the outline
+is missing. O-series support remains **experimental / best-effort**.
+
+The O1200 LiDAR Pro also runs TrueEdge edge trims as their own ``clean`` job
+type, ``borderrotate`` (captured on class ``2i0fns``, firmware ``1.15.16``).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -41,8 +44,15 @@ from .goat_g1_models import (
     FAMILY_G1,
     FAMILY_O_SERIES,
     FAMILY_UNKNOWN,
-    classify_goat_family,
+    VARIANT_O1200_LIDAR_PRO,
+    classify_goat_g1_variant,
+    variant_family,
 )
+
+EDGE_TRIM_TASK_TYPE = "borderrotate"
+# The app sent this value when starting a trim on a single-lawn map.
+_EDGE_TRIM_START_VALUE = "reid:1"
+_EDGE_TRIM_VARIANTS = frozenset({VARIANT_O1200_LIDAR_PRO})
 
 
 class MowerFamily(StrEnum):
@@ -84,14 +94,24 @@ class CapabilityProfile:
     clean_info_command: str
     # Fields requested via getPos (UWB vs RTK reference points).
     position_fields: tuple[str, ...]
+    # The G1 app lists a camera lens brush. O-series getLifeSpan replies have
+    # none: blade only on the O800 RTK, and the app asks the O1200 LiDAR Pro
+    # for blade, weedRope and trimmerBrush.
+    has_lens_brush: bool
+    # Whether the mower has a TrueEdge trimmer (``borderrotate`` jobs).
+    edge_trim: bool
     experimental: bool
     label: str
 
-    def clean_body(self, act: str) -> dict[str, Any]:
+    def clean_body(self, act: str, task_type: str | None = None) -> dict[str, Any]:
         """Return the ``clean`` / ``clean_V2`` body for a mowing action.
 
         ``act`` is one of ``start`` / ``resume`` / ``pause`` / ``stop``.
+        ``task_type`` is the running job's type. The app pauses, resumes and
+        stops a TrueEdge trim by that type instead of ``auto``.
         """
+        if self.edge_trim and task_type == EDGE_TRIM_TASK_TYPE and act != "start":
+            return {"act": act, "content": {"type": EDGE_TRIM_TASK_TYPE}}
         if self.clean_always_content:
             return {"act": act, "content": {"type": "auto"}}
         if act == "start":
@@ -99,6 +119,13 @@ class CapabilityProfile:
         if act == "stop":
             return {"act": "stop", "content": {"type": self.stop_content_type}}
         return {"act": act}
+
+    def edge_trim_body(self) -> dict[str, Any]:
+        """Return the ``clean`` body that starts a TrueEdge trim."""
+        return {
+            "act": "start",
+            "content": {"type": EDGE_TRIM_TASK_TYPE, "value": _EDGE_TRIM_START_VALUE},
+        }
 
     def as_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable snapshot for diagnostics."""
@@ -109,6 +136,8 @@ class CapabilityProfile:
             "clean_command": self.clean_command,
             "clean_info_command": self.clean_info_command,
             "position_fields": list(self.position_fields),
+            "has_lens_brush": self.has_lens_brush,
+            "edge_trim": self.edge_trim,
             "experimental": self.experimental,
             "label": self.label,
         }
@@ -126,6 +155,8 @@ _G1_PROFILE = CapabilityProfile(
     clean_always_content=False,
     clean_info_command="getCleanInfo_V2",
     position_fields=("chargePos", "deebotPos", "uwbPos"),
+    has_lens_brush=True,
+    edge_trim=False,
     experimental=False,
     label="GOAT G1 line (UWB, V2 map)",
 )
@@ -139,6 +170,8 @@ _O_SERIES_PROFILE = CapabilityProfile(
     clean_always_content=True,
     clean_info_command="getCleanInfo",
     position_fields=("chargePos", "deebotPos", "rtkPos"),
+    has_lens_brush=False,
+    edge_trim=False,
     experimental=True,
     label="GOAT O-series (RTK, getMapTrack dialect, experimental)",
 )
@@ -152,6 +185,8 @@ _UNKNOWN_PROFILE = CapabilityProfile(
     clean_always_content=False,
     clean_info_command="getCleanInfo_V2",
     position_fields=("chargePos", "deebotPos", "uwbPos"),
+    has_lens_brush=True,
+    edge_trim=False,
     experimental=False,
     label="Unknown GOAT (assuming G1 / V2 map)",
 )
@@ -174,4 +209,8 @@ def profile_for_family(family: MowerFamily | str) -> CapabilityProfile:
 
 def profile_for_model(device_name: str | None) -> CapabilityProfile:
     """Return the capability profile for an ECOVACS ``deviceName``."""
-    return profile_for_family(classify_goat_family(device_name))
+    variant = classify_goat_g1_variant(device_name)
+    profile = profile_for_family(variant_family(variant))
+    if variant in _EDGE_TRIM_VARIANTS:
+        profile = replace(profile, edge_trim=True)
+    return profile
