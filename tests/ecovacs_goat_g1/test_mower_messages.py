@@ -1,5 +1,6 @@
 """Tests for ECOVACS mower message parsing."""
 
+from datetime import UTC, datetime
 from pathlib import Path
 import sys
 import types
@@ -29,6 +30,8 @@ from custom_components.ecovacs_goat_g1.mower_models import (
     MowerMapInfo,
     MowerMapTrace,
     MowerState,
+    ScheduleSlot,
+    next_schedule_start,
 )
 from custom_components.ecovacs_goat_g1.mower_api import (
     EcovacsApiError,
@@ -895,6 +898,166 @@ def test_clean_info_records_running_task_type() -> None:
 
     assert state.activity is MowerActivity.IDLE
     assert state.task_type is None
+
+
+_SCHEDULED_MOW = {
+    "trigger": "schedule",
+    "other": "",
+    "rotationPause": 0,
+    "ssid": "8",
+    "state": "clean",
+    "cleanState": {
+        "motionState": "working",
+        "content": {"type": "spotArea", "value": "1", "subContent": {"type": "spotArea"}},
+    },
+}
+
+
+def test_o_series_scheduled_mow_reports_through_schedule_task_info() -> None:
+    """The O1200 LiDAR Pro keeps getCleanInfo idle during a scheduled mow."""
+    state = apply_command_data(
+        MowerState(activity=MowerActivity.DOCKED),
+        "onScheduleTaskInfo",
+        _SCHEDULED_MOW,
+    )
+
+    assert state.activity is MowerActivity.MOWING
+    assert state.task_type == "spotArea"
+
+    state = apply_command_data(
+        state,
+        "getInfo",
+        {
+            "getCleanInfo": {"data": {"state": "idle"}, "code": 0, "msg": "ok"},
+            "getChargeState": {"code": 0, "msg": "ok", "data": {"isCharging": 0}},
+            "getScheduleTaskInfo": {"code": 10000, "msg": "fail"},
+        },
+    )
+
+    assert state.activity is MowerActivity.MOWING
+    assert state.task_type == "spotArea"
+
+    state = apply_command_data(
+        state, "onScheduleTaskInfo", {"trigger": "schedule", "state": "idle"}
+    )
+    state = apply_command_data(state, "getCleanInfo", {"state": "idle"})
+
+    assert state.activity is MowerActivity.IDLE
+    assert state.task_type is None
+    assert state.schedule_task_running is False
+
+
+def test_charging_or_an_app_job_ends_a_scheduled_mow() -> None:
+    """A missed schedule end must not hide later getCleanInfo idle replies."""
+    scheduled = apply_command_data(
+        MowerState(activity=MowerActivity.DOCKED), "onScheduleTaskInfo", _SCHEDULED_MOW
+    )
+
+    docked = apply_command_data(scheduled, "onChargeState", {"isCharging": 1})
+    docked = apply_command_data(docked, "getCleanInfo", {"state": "idle"})
+
+    assert docked.activity is MowerActivity.DOCKED
+    assert docked.schedule_task_running is False
+
+    app_job = apply_command_data(
+        scheduled,
+        "onCleanInfo",
+        {
+            "trigger": "app",
+            "state": "clean",
+            "cleanState": {"motionState": "working", "content": {"type": "auto"}},
+        },
+    )
+    app_job = apply_command_data(app_job, "onCleanInfo", {"trigger": "app", "state": "idle"})
+
+    assert app_job.activity is MowerActivity.IDLE
+    assert app_job.task_type is None
+
+
+def test_error_codes_carry_the_app_alert_text() -> None:
+    blocked = apply_command_data(MowerState(), "onError", {"code": [406]})
+    sensor = apply_command_data(MowerState(), "onError", {"code": [433]})
+
+    assert blocked.error_description == "Cutting system blocked. Please check."
+    assert sensor.error_description == "Sensor fault (433). Please check."
+    assert blocked.activity is MowerActivity.ERROR
+
+
+def test_o_series_schedule_lists_the_upcoming_mows() -> None:
+    """getScheduleLatestTask sDay is the weekday with Monday 1."""
+    state = apply_command_data(
+        MowerState(),
+        "getInfo",
+        {
+            "getScheduleLatestTask": {
+                "code": 0,
+                "msg": "ok",
+                "data": {
+                    "task": [
+                        {"ssid": "8", "sDay": 5, "eDay": 5, "sTime": "17:00", "eTime": "19:00"},
+                        {"ssid": "9", "sDay": 0, "sTime": "9:5"},
+                        {"ssid": "x", "sDay": 9, "sTime": "10:00"},
+                    ]
+                },
+            }
+        },
+    )
+
+    assert state.upcoming_schedule == (
+        ScheduleSlot(weekday=5, start="17:00"),
+        ScheduleSlot(weekday=7, start="09:05"),
+    )
+
+    g1 = apply_command_data(
+        state,
+        "onScheduleLatestTask",
+        {"channel": "get", "workType": "", "status": 0, "mow": []},
+    )
+
+    assert g1.upcoming_schedule == state.upcoming_schedule
+
+
+def test_next_schedule_start_picks_the_nearest_weekly_slot() -> None:
+    slots = (ScheduleSlot(weekday=5, start="17:00"), ScheduleSlot(weekday=3, start="16:00"))
+    friday_afternoon = datetime(2026, 11, 6, 16, 56, tzinfo=UTC)
+
+    assert next_schedule_start(slots, friday_afternoon) == datetime(
+        2026, 11, 6, 17, 0, tzinfo=UTC
+    )
+    assert next_schedule_start(slots, friday_afternoon.replace(hour=17, minute=0)) == (
+        datetime(2026, 11, 11, 16, 0, tzinfo=UTC)
+    )
+    assert next_schedule_start((), friday_afternoon) is None
+
+
+def test_get_ota_reports_the_firmware_version() -> None:
+    state = apply_command_data(
+        MowerState(),
+        "getInfo",
+        {
+            "getOta": {
+                "code": 0,
+                "msg": "ok",
+                "data": {"status": "idle", "progress": 0, "ver": "1.36.208"},
+            }
+        },
+    )
+
+    assert state.firmware_version == "1.36.208"
+
+
+def test_o800_charge_start_places_the_dock() -> None:
+    """The O800 RTK marks getPos chargePos invalid but sends chargerPos on docking."""
+    state = apply_command_data(
+        MowerState(activity=MowerActivity.RETURNING),
+        "onFwBuryPoint-bd_task-charge-start",
+        {"battery": 94, "chargerPos": "0,0", "voltage": 19610},
+    )
+
+    assert [point.as_dict() for point in state.map.charge_positions] == [
+        {"x": 0, "y": 0}
+    ]
+    assert state.map.current_position is None
 
 
 def test_o_series_map_info_diagonal_steps() -> None:

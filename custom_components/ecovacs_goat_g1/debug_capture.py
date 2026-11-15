@@ -1,16 +1,29 @@
-"""Opt-in debug capture support for ECOVACS GOAT troubleshooting."""
+"""Opt-in debug capture support for ECOVACS GOAT troubleshooting.
+
+Events arrive on the Home Assistant event loop and the MQTT thread, so
+``capture_event`` and ``summary`` never touch the disk: a writer thread appends
+the events, and the session list is kept in memory. ``load``, ``start``,
+``stop``, ``clear``, ``export_zip``, ``recent_events`` and ``close`` do file
+work and must run in an executor.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import partial
 import json
+import logging
 from pathlib import Path
+import queue
 import shutil
-from threading import Lock
+from threading import Lock, Thread
 import time
 from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
+
+_LOGGER = logging.getLogger(__name__)
 
 DEFAULT_CAPTURE_DURATION_SECONDS = 30 * 60
 DEFAULT_CAPTURE_MAX_BYTES = 25 * 1024 * 1024
@@ -69,11 +82,16 @@ class DebugCaptureStore:
         self._lock = Lock()
         self._session: CaptureSession | None = None
         self._event_path: Path | None = None
+        self._manifest: dict[str, Any] = {}
+        self._session_bytes = 0
+        self._sessions: dict[str, dict[str, Any]] = {}
         self._redaction_values: set[str] = set()
         self._default_include_raw_payloads = True
         self._default_max_duration_seconds = DEFAULT_CAPTURE_DURATION_SECONDS
         self._default_max_bytes = DEFAULT_CAPTURE_MAX_BYTES
         self._last_export: dict[str, str] | None = None
+        self._writes: queue.Queue[Callable[[], None] | None] = queue.Queue()
+        self._writer: Thread | None = None
 
     def configure(
         self,
@@ -103,6 +121,20 @@ class DebugCaptureStore:
         """Return whether a capture session is active."""
         return self._session is not None
 
+    def load(self) -> None:
+        """Read the retained sessions from disk."""
+        sessions: dict[str, dict[str, Any]] = {}
+        if self._base_path.exists():
+            for path in self._base_path.iterdir():
+                if path.is_dir():
+                    sessions[path.name] = _session_summary(path)
+        with self._lock:
+            if self._session is not None:
+                sessions[self._session.session_id] = self._sessions[
+                    self._session.session_id
+                ]
+            self._sessions = sessions
+
     def start(
         self,
         *,
@@ -113,36 +145,57 @@ class DebugCaptureStore:
     ) -> dict[str, Any]:
         """Start a new capture session, replacing any active session."""
         with self._lock:
-            if self._session is not None:
-                self._stop_locked("replaced")
+            self._stop_locked("replaced")
+        self._writes.join()
 
-            self._base_path.mkdir(parents=True, exist_ok=True)
-            session_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            session_path = self._base_path / session_id
-            suffix = 1
-            while session_path.exists():
-                suffix += 1
-                session_path = self._base_path / f"{session_id}-{suffix}"
-            session_path.mkdir(parents=True)
+        self._base_path.mkdir(parents=True, exist_ok=True)
+        session_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        session_path = self._base_path / session_id
+        suffix = 1
+        while session_path.exists():
+            suffix += 1
+            session_path = self._base_path / f"{session_id}-{suffix}"
+        session_path.mkdir(parents=True)
 
-            started_at = _utc_now()
-            session = CaptureSession(
-                session_id=session_path.name,
-                path=session_path,
-                started_at=started_at,
-                include_raw_payloads=self._default_include_raw_payloads
-                if include_raw_payloads is None
-                else include_raw_payloads,
-                max_duration_seconds=self._default_max_duration_seconds
-                if max_duration_seconds is None
-                else max(60, max_duration_seconds),
-                max_bytes=self._default_max_bytes
-                if max_bytes is None
-                else max(1024 * 1024, max_bytes),
-            )
+        session = CaptureSession(
+            session_id=session_path.name,
+            path=session_path,
+            started_at=_utc_now(),
+            include_raw_payloads=self._default_include_raw_payloads
+            if include_raw_payloads is None
+            else include_raw_payloads,
+            max_duration_seconds=self._default_max_duration_seconds
+            if max_duration_seconds is None
+            else max(60, max_duration_seconds),
+            max_bytes=self._default_max_bytes
+            if max_bytes is None
+            else max(1024 * 1024, max_bytes),
+        )
+        manifest = {
+            "session_id": session.session_id,
+            "started_at": session.started_at,
+            "reason": reason,
+            "include_raw_payloads": session.include_raw_payloads,
+            "max_duration_seconds": session.max_duration_seconds,
+            "max_bytes": session.max_bytes,
+        }
+        _write_json(session_path / "manifest.json", manifest)
+        removed = self._remove_old_sessions()
+
+        with self._lock:
+            for name in removed:
+                self._sessions.pop(name, None)
             self._session = session
             self._event_path = session_path / "events.jsonl"
-            self._write_manifest_locked(reason=reason)
+            self._manifest = manifest
+            self._session_bytes = 0
+            self._sessions[session.session_id] = {
+                "session_id": session.session_id,
+                "started_at": session.started_at,
+                "stopped_at": None,
+                "stop_reason": None,
+                "bytes": 0,
+            }
             self._write_event_locked(
                 "capture_started",
                 {
@@ -152,71 +205,72 @@ class DebugCaptureStore:
                     "max_bytes": session.max_bytes,
                 },
             )
-            self._cleanup_old_sessions_locked()
-            return self.summary()
+        return self.summary()
 
     def stop(self, reason: str = "manual") -> dict[str, Any]:
-        """Stop the current capture session."""
+        """Stop the current capture session and wait until it is on disk."""
         with self._lock:
             self._stop_locked(reason)
-            return self.summary()
+        self._writes.join()
+        return self.summary()
 
     def clear(self) -> dict[str, Any]:
         """Remove all capture sessions and exported zips."""
         with self._lock:
             self._stop_locked("cleared")
-            if self._base_path.exists():
-                shutil.rmtree(self._base_path)
-            if self._export_path.exists():
-                shutil.rmtree(self._export_path)
+        self._writes.join()
+        if self._base_path.exists():
+            shutil.rmtree(self._base_path)
+        if self._export_path.exists():
+            shutil.rmtree(self._export_path)
+        with self._lock:
+            self._sessions = {}
             self._last_export = None
-            return self.summary()
+        return self.summary()
+
+    def close(self) -> None:
+        """Write any queued events and end the writer thread."""
+        writer = self._writer
+        if writer is None or not writer.is_alive():
+            return
+        self._writes.put(None)
+        writer.join()
+        self._writer = None
 
     def mark(self, message: str) -> None:
         """Add a user marker to the active capture."""
         self.capture_event("marker", {"message": message})
 
     def capture_event(self, event_type: str, data: dict[str, Any] | None = None) -> None:
-        """Append a redacted event to the active capture session."""
+        """Queue a redacted event for the active capture session."""
         with self._lock:
             if self._session is None:
                 return
             if self._session_expired_locked():
                 self._stop_locked("expired")
                 return
-            if self._size_exceeded_locked():
+            if self._session_bytes > self._session.max_bytes:
                 self._stop_locked("max_size_exceeded")
                 return
             self._write_event_locked(event_type, data or {})
-            if self._size_exceeded_locked():
+            if self._session_bytes > self._session.max_bytes:
                 self._stop_locked("max_size_exceeded")
 
     def summary(self) -> dict[str, Any]:
         """Return a small serialisable capture summary."""
-        sessions = []
-        if self._base_path.exists():
-            for path in sorted(self._base_path.iterdir(), reverse=True):
-                if not path.is_dir():
-                    continue
-                manifest = _read_json(path / "manifest.json")
-                event_path = path / "events.jsonl"
-                sessions.append(
-                    {
-                        "session_id": path.name,
-                        "started_at": manifest.get("started_at"),
-                        "stopped_at": manifest.get("stopped_at"),
-                        "stop_reason": manifest.get("stop_reason"),
-                        "bytes": event_path.stat().st_size if event_path.exists() else 0,
-                    }
-                )
-        return {
-            "active": self._session.session_id if self._session else None,
-            "sessions": sessions,
-            "last_export": self._last_export,
-        }
+        with self._lock:
+            return {
+                "active": self._session.session_id if self._session else None,
+                "sessions": [
+                    dict(self._sessions[name])
+                    for name in sorted(self._sessions, reverse=True)
+                ],
+                "last_export": self._last_export,
+            }
 
     def recent_events(self, limit: int = 100) -> list[dict[str, Any]]:
         """Return recent events from the latest capture session."""
+        self._writes.join()
         session = self._latest_session_path()
         if session is None:
             return []
@@ -234,6 +288,7 @@ class DebugCaptureStore:
 
     def export_zip(self, session_id: str | None = None) -> dict[str, str]:
         """Create a zip for the requested or latest capture session."""
+        self._writes.join()
         session = self._session_path(session_id) if session_id else self._latest_session_path()
         if session is None:
             raise FileNotFoundError("No ECOVACS debug capture sessions exist")
@@ -244,12 +299,14 @@ class DebugCaptureStore:
             for path in sorted(session.iterdir()):
                 if path.is_file():
                     archive.write(path, arcname=path.name)
-        self._last_export = {
+        export = {
             "session_id": session.name,
             "path": str(zip_path),
             "url": f"/local/ecovacs_goat/debug/{zip_path.name}",
         }
-        return self._last_export
+        with self._lock:
+            self._last_export = export
+        return export
 
     def _write_event_locked(self, event_type: str, data: dict[str, Any]) -> None:
         assert self._session is not None
@@ -261,53 +318,59 @@ class DebugCaptureStore:
         }
         if not self._session.include_raw_payloads:
             event["data"] = _drop_raw_payloads(event["data"])
-        with self._event_path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
-            file.write("\n")
-
-    def _write_manifest_locked(self, *, reason: str | None) -> None:
-        assert self._session is not None
-        manifest = {
-            "session_id": self._session.session_id,
-            "started_at": self._session.started_at,
-            "reason": reason,
-            "include_raw_payloads": self._session.include_raw_payloads,
-            "max_duration_seconds": self._session.max_duration_seconds,
-            "max_bytes": self._session.max_bytes,
-        }
-        (self._session.path / "manifest.json").write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
-        )
+        line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+        self._session_bytes += len(line.encode("utf-8"))
+        self._sessions[self._session.session_id]["bytes"] = self._session_bytes
+        self._enqueue(partial(_append_text, self._event_path, line))
 
     def _stop_locked(self, reason: str) -> None:
         if self._session is None:
             return
         self._write_event_locked("capture_stopped", {"reason": reason})
-        manifest_path = self._session.path / "manifest.json"
-        manifest = _read_json(manifest_path)
-        manifest["stopped_at"] = _utc_now()
-        manifest["stop_reason"] = reason
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        stopped_at = _utc_now()
+        manifest = {**self._manifest, "stopped_at": stopped_at, "stop_reason": reason}
+        self._sessions[self._session.session_id].update(
+            stopped_at=stopped_at, stop_reason=reason
+        )
+        self._enqueue(partial(_write_json, self._session.path / "manifest.json", manifest))
         self._session = None
         self._event_path = None
+
+    def _enqueue(self, write: Callable[[], None]) -> None:
+        if self._writer is None or not self._writer.is_alive():
+            self._writer = Thread(
+                target=self._write_queued,
+                name="ecovacs_goat_debug_capture",
+                daemon=True,
+            )
+            self._writer.start()
+        self._writes.put(write)
+
+    def _write_queued(self) -> None:
+        while True:
+            write = self._writes.get()
+            try:
+                if write is None:
+                    return
+                write()
+            except OSError as err:
+                _LOGGER.warning("ECOVACS debug capture write failed: %s", err)
+            finally:
+                self._writes.task_done()
 
     def _session_expired_locked(self) -> bool:
         assert self._session is not None
         started = datetime.fromisoformat(self._session.started_at).timestamp()
         return time.time() - started > self._session.max_duration_seconds
 
-    def _size_exceeded_locked(self) -> bool:
-        if self._event_path is None or not self._event_path.exists():
-            return False
-        assert self._session is not None
-        return self._event_path.stat().st_size > self._session.max_bytes
-
-    def _cleanup_old_sessions_locked(self) -> None:
+    def _remove_old_sessions(self) -> list[str]:
         if not self._base_path.exists():
-            return
+            return []
         sessions = [path for path in sorted(self._base_path.iterdir()) if path.is_dir()]
-        for path in sessions[: -self._retained_sessions]:
+        removed = sessions[: -self._retained_sessions]
+        for path in removed:
             shutil.rmtree(path, ignore_errors=True)
+        return [path.name for path in removed]
 
     def _latest_session_path(self) -> Path | None:
         if not self._base_path.exists():
@@ -340,6 +403,27 @@ class DebugCaptureStore:
 def _utc_now() -> str:
     """Return an ISO UTC timestamp."""
     return datetime.now(UTC).isoformat()
+
+
+def _append_text(path: Path, text: str) -> None:
+    with path.open("a", encoding="utf-8", newline="\n") as file:
+        file.write(text)
+
+
+def _write_json(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _session_summary(path: Path) -> dict[str, Any]:
+    manifest = _read_json(path / "manifest.json")
+    event_path = path / "events.jsonl"
+    return {
+        "session_id": path.name,
+        "started_at": manifest.get("started_at"),
+        "stopped_at": manifest.get("stopped_at"),
+        "stop_reason": manifest.get("stop_reason"),
+        "bytes": event_path.stat().st_size if event_path.exists() else 0,
+    }
 
 
 def _json_safe(value: Any) -> Any:

@@ -20,6 +20,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .debug_capture import DebugCaptureStore
 from .goat_g1_models import classify_goat_g1_variant
 from .mower_profiles import (
+    EDGE_TRIM_LIFESPAN_TYPES,
     EDGE_TRIM_TASK_TYPE,
     CapabilityProfile,
     MapDialect,
@@ -57,6 +58,9 @@ MQTT_READBACK_DEBOUNCE_SECONDS = 3
 MAP_TRACE_DIRECTION_THRESHOLD_DEGREES = 90
 MAP_TRACE_POSITION_HEADING_MIN_DISTANCE = 20
 LIVE_POSITION_SEGMENT_MAX_POINTS = 800
+# Without a mower trace (O1200 LiDAR Pro) the positions are the whole mowed
+# path. onPos arrives about 100 times a minute, so this covers 2.5 hours.
+UNTRACED_POSITION_HISTORY_MAX_POINTS = 15000
 LIVE_POSITION_STREAM_REQUEST_MIN_INTERVAL_SECONDS = 60
 APP_PING_INTERVAL_SECONDS = 120
 APP_PRESENCE_MQTT_TTL_SECONDS = APP_PING_INTERVAL_SECONDS + 30
@@ -508,11 +512,14 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         """Refresh from the mower using a small app-style command set."""
         try:
             await self._async_refresh_state_groups()
-            for command, payload in (
+            reads: list[tuple[str, Any]] = [
                 ("getWifiList", {}),
                 ("getLifeSpan", {}),
                 ("getTotalStats", {}),
-            ):
+            ]
+            if self._capability.edge_trim:
+                reads.append(("getLifeSpan", list(EDGE_TRIM_LIFESPAN_TYPES)))
+            for command, payload in reads:
                 try:
                     response = await self.api.control(self.device, command, payload)
                     self._merge_reply(command, response)
@@ -716,8 +723,13 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         compact_history = history or (current,)
         if compact_history[-1] != current:
             compact_history = (*compact_history, current)
-        if len(compact_history) > LIVE_POSITION_SEGMENT_MAX_POINTS:
-            compact_history = compact_history[-LIVE_POSITION_SEGMENT_MAX_POINTS:]
+        max_points = (
+            LIVE_POSITION_SEGMENT_MAX_POINTS
+            if state.map.trace.path
+            else UNTRACED_POSITION_HISTORY_MAX_POINTS
+        )
+        if len(compact_history) > max_points:
+            compact_history = compact_history[-max_points:]
         if compact_history == history:
             return state
         return replace(
@@ -1342,10 +1354,16 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         rediscovering that on every device.
         """
         clean_info = self._capability.clean_info_command
-        if clean_info == "getCleanInfo_V2":
+        schedule_info = self._capability.schedule_info_command
+        if clean_info == "getCleanInfo_V2" and schedule_info is None:
             return STARTUP_GET_INFO_GROUPS
+        status = (clean_info,) if schedule_info is None else (clean_info, schedule_info)
         return tuple(
-            tuple(clean_info if cmd == "getCleanInfo_V2" else cmd for cmd in group)
+            tuple(
+                adapted
+                for cmd in group
+                for adapted in (status if cmd == "getCleanInfo_V2" else (cmd,))
+            )
             for group in STARTUP_GET_INFO_GROUPS
         )
 

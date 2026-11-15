@@ -50,6 +50,8 @@ from .goat_g1_models import (
 )
 
 EDGE_TRIM_TASK_TYPE = "borderrotate"
+# The app asks an edge-trimming mower for these consumables by name.
+EDGE_TRIM_LIFESPAN_TYPES = ("blade", "weedRope", "trimmerBrush")
 # The app sent this value when starting a trim on a single-lawn map.
 _EDGE_TRIM_START_VALUE = "reid:1"
 _EDGE_TRIM_VARIANTS = frozenset({VARIANT_O1200_LIDAR_PRO})
@@ -92,6 +94,9 @@ class CapabilityProfile:
     clean_always_content: bool
     # Grouped getInfo key used to read mowing status.
     clean_info_command: str
+    # Grouped getInfo key for scheduled jobs. The O1200 LiDAR Pro reports a
+    # scheduled mow only there while getCleanInfo stays "idle".
+    schedule_info_command: str | None
     # Fields requested via getPos (UWB vs RTK reference points).
     position_fields: tuple[str, ...]
     # The G1 app lists a camera lens brush. O-series getLifeSpan replies have
@@ -135,6 +140,7 @@ class CapabilityProfile:
             "map_uses_v2": self.map_uses_v2,
             "clean_command": self.clean_command,
             "clean_info_command": self.clean_info_command,
+            "schedule_info_command": self.schedule_info_command,
             "position_fields": list(self.position_fields),
             "has_lens_brush": self.has_lens_brush,
             "edge_trim": self.edge_trim,
@@ -154,6 +160,7 @@ _G1_PROFILE = CapabilityProfile(
     stop_content_type="",
     clean_always_content=False,
     clean_info_command="getCleanInfo_V2",
+    schedule_info_command=None,
     position_fields=("chargePos", "deebotPos", "uwbPos"),
     has_lens_brush=True,
     edge_trim=False,
@@ -169,6 +176,7 @@ _O_SERIES_PROFILE = CapabilityProfile(
     stop_content_type="auto",
     clean_always_content=True,
     clean_info_command="getCleanInfo",
+    schedule_info_command="getScheduleTaskInfo",
     position_fields=("chargePos", "deebotPos", "rtkPos"),
     has_lens_brush=False,
     edge_trim=False,
@@ -184,6 +192,7 @@ _UNKNOWN_PROFILE = CapabilityProfile(
     stop_content_type="",
     clean_always_content=False,
     clean_info_command="getCleanInfo_V2",
+    schedule_info_command=None,
     position_fields=("chargePos", "deebotPos", "uwbPos"),
     has_lens_brush=True,
     edge_trim=False,

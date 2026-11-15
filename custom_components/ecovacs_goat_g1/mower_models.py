@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -294,6 +295,31 @@ def _sample_positions(
 
 
 @dataclass(frozen=True)
+class ScheduleSlot:
+    """One weekly scheduled mow: ISO weekday (Monday 1) and local start time."""
+
+    weekday: int
+    start: str
+
+
+def next_schedule_start(
+    slots: tuple[ScheduleSlot, ...], now: datetime
+) -> datetime | None:
+    """Return the next start among weekly slots, in the timezone of ``now``."""
+    starts = []
+    for slot in slots:
+        hour, minute = (int(part) for part in slot.start.split(":", 1))
+        days_ahead = (slot.weekday - now.isoweekday()) % 7
+        start = (now + timedelta(days=days_ahead)).replace(
+            hour=hour, minute=minute, second=0, microsecond=0
+        )
+        if start <= now:
+            start += timedelta(days=7)
+        starts.append(start)
+    return min(starts, default=None)
+
+
+@dataclass(frozen=True)
 class MowerState:
     """Complete cached mower state used by Home Assistant entities."""
 
@@ -301,6 +327,9 @@ class MowerState:
     activity: MowerActivity = MowerActivity.UNKNOWN
     task_id: str | None = None
     task_type: str | None = None
+    schedule_task_running: bool = False
+    upcoming_schedule: tuple[ScheduleSlot, ...] = ()
+    firmware_version: str | None = None
     battery: int | None = None
     charging: bool | None = None
     charge_mode: str | None = None

@@ -262,6 +262,7 @@ class FakeApi:
         self.pushes: dict[str, list[tuple[str, dict]]] = {}
         self.commands: list[str] = []
         self.payloads: list[tuple[str, Any]] = []
+        self.getinfo: dict[str, dict] = {}
 
     async def control(self, _device: MowerDevice, command: str, payload: Any) -> dict:
         self.commands.append(command)
@@ -272,6 +273,14 @@ class FakeApi:
         await asyncio.sleep(0)
         if command == "getPos":
             return GET_POS_REPLY
+        if command == "getInfo":
+            return {
+                "body": {
+                    "data": {
+                        name: self.getinfo[name] for name in payload if name in self.getinfo
+                    }
+                }
+            }
         return {"body": {"data": {}}}
 
 
@@ -489,6 +498,110 @@ async def test_edge_trim_sends_borderrotate_until_it_ends() -> None:
         {"act": "start", "content": {"type": "auto"}},
     ]
     assert coordinator.data.task_type == "auto"
+    await coordinator.async_stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["GOAT O800 RTK", "GOAT O1200 LiDAR Pro"])
+async def test_o_series_readback_keeps_a_scheduled_mow_running(model: str) -> None:
+    """getCleanInfo says idle during a scheduled mow; getScheduleTaskInfo does not."""
+    api = FakeApi()
+    api.getinfo = {
+        "getCleanInfo": {"code": 0, "msg": "ok", "data": {"state": "idle"}},
+        "getScheduleTaskInfo": {
+            "code": 0,
+            "msg": "ok",
+            "data": {
+                "trigger": "schedule",
+                "state": "clean",
+                "cleanState": {
+                    "motionState": "working",
+                    "content": {"type": "spotArea", "value": "1"},
+                },
+            },
+        },
+    }
+    coordinator = _coordinator(api, MowerState(activity=MowerActivity.DOCKED), model=model)
+
+    await coordinator.async_refresh_state()
+    await coordinator.async_refresh_state()
+
+    group = next(
+        body for command, body in api.payloads
+        if command == "getInfo" and "getCleanInfo" in body
+    )
+    assert group.index("getScheduleTaskInfo") == group.index("getCleanInfo") + 1
+    assert coordinator.data.activity is MowerActivity.MOWING
+    assert coordinator.data.task_type == "spotArea"
+    await coordinator.async_stop()
+
+
+@pytest.mark.asyncio
+async def test_g1_readback_does_not_ask_for_schedule_task_info() -> None:
+    api = FakeApi()
+    coordinator = _coordinator(api, MowerState())
+
+    await coordinator.async_refresh_state()
+
+    requested = [
+        name for command, body in api.payloads if command == "getInfo" for name in body
+    ]
+    assert "getCleanInfo_V2" in requested
+    assert "getScheduleTaskInfo" not in requested
+    await coordinator.async_stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "trace", "kept"),
+    [
+        ("GOAT G1-800", (MapPosition(x=1, y=1),), 800),
+        ("GOAT O1200 LiDAR Pro", (), 1001),
+    ],
+)
+async def test_live_path_is_trimmed_only_when_the_mower_sends_a_trace(
+    model: str, trace: tuple[MapPosition, ...], kept: int
+) -> None:
+    """Without a mower trace, the positions are the whole mowed path."""
+    mowing = MowerState(
+        activity=MowerActivity.MOWING,
+        map=MowerMap(
+            mid="0",
+            current_position=MapPosition(x=5000, y=0),
+            position_history=tuple(MapPosition(x=x, y=0) for x in range(1000)),
+            trace=MowerMapTrace(path=trace),
+        ),
+    )
+    coordinator = _coordinator(FakeApi(), mowing, model=model)
+
+    compact = coordinator._compact_live_position_segment(mowing)
+
+    assert len(compact.map.position_history) == kept
+    assert compact.map.position_history[-1] == MapPosition(x=5000, y=0)
+    await coordinator.async_stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "asks_for_trimmer"),
+    [
+        ("GOAT O1200 LiDAR Pro", True),
+        ("GOAT O800 RTK", False),
+        ("GOAT G1-800", False),
+    ],
+)
+async def test_trimmer_lifespans_are_requested_by_name(
+    model: str, asks_for_trimmer: bool
+) -> None:
+    """The app asks an edge-trimming mower for weedRope and trimmerBrush."""
+    api = FakeApi()
+    coordinator = _coordinator(api, MowerState(), model=model)
+
+    await coordinator._async_update_data()
+
+    lifespan_requests = [body for command, body in api.payloads if command == "getLifeSpan"]
+    assert lifespan_requests[0] == {}
+    assert (["blade", "weedRope", "trimmerBrush"] in lifespan_requests) is asks_for_trimmer
     await coordinator.async_stop()
 
 

@@ -86,6 +86,7 @@ class EcovacsController:
 
     async def initialize(self) -> None:
         """Initialize mower devices and coordinators."""
+        await self._hass.async_add_executor_job(self._debug_capture.load)
         started: list[MowerCoordinator] = []
         try:
             legacy_session = self._legacy_session_from_entry()
@@ -164,6 +165,7 @@ class EcovacsController:
             pass
         await self._stop_coordinators(self._coordinators)
         self._coordinators.clear()
+        await self._hass.async_add_executor_job(self._debug_capture.close)
 
     async def _async_account_session_updated(
         self, account_session: AccountSession | None

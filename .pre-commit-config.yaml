@@ -86,6 +86,9 @@ repos:
           - vuln
           - --timeout
           - 15m
+          # mirror.gcr.io has stalled at about 50 KiB/s; GitHub is tried first.
+          - --db-repository
+          - ghcr.io/aquasecurity/trivy-db:2,mirror.gcr.io/aquasec/trivy-db:2
           - --severity
           - HIGH,CRITICAL
           - .

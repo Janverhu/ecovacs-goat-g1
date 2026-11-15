@@ -20,6 +20,7 @@ from .mower_models import (
     MowerState,
     MowerStats,
     NetworkInfo,
+    ScheduleSlot,
 )
 
 MOWING_EFFICIENCY_OPTIONS = ("quick", "delicate")
@@ -35,10 +36,37 @@ OBSTACLE_AVOIDANCE_BY_LEVEL = {
 OBSTACLE_AVOIDANCE_LEVELS = {
     value: key for key, value in OBSTACLE_AVOIDANCE_BY_LEVEL.items()
 }
+# 401-435 follow the GOAT app's English alert texts.
 ERROR_DESCRIPTIONS = {
     0: "NoError: Robot is operational",
     100: "NoError: Robot is operational",
+    401: "Robot tilted. Place it on flat ground.",
+    402: "Robot lifted. Place it back on the ground.",
+    404: "Battery malfunction. Please check.",
+    405: "Left rear wheel fault. Please check.",
+    406: "Cutting system blocked. Please check.",
+    407: "Bumper fault. Please check.",
+    408: "Robot trapped. Give it a hand.",
+    409: "Unable to clean the camera. Please check.",
+    410: "Robot lost. Please check.",
+    411: "Station location fault. Please check.",
+    412: "Navigation beacon signal fault. Please check.",
+    413: "Open the panoramic camera cover.",
+    414: "Front AI camera and ToF sensor are dirty.",
+    415: "Panoramic camera is dirty. Wipe it clean.",
+    416: "High battery temperature.",
+    417: "Low battery temperature.",
+    418: "Robot entered a no-entry zone. Move it away now.",
+    419: "Robot lifted. Theft alert. Please check now.",
+    420: "Off map. Theft alert. Please check now.",
+    421: "No navigation beacon signal. Please check.",
     422: "Weak signal, back to station",
+    423: "Weak signal.",
+    424: "Right rear wheel fault. Please check.",
+    **{
+        code: f"Sensor fault ({code}). Please check."
+        for code in (403, 430, 431, 432, 433, 434, 435)
+    },
     4200: "Robot not reachable",
     500: "Request Timeout",
 }
@@ -148,43 +176,35 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
                 state = replace(state, battery=_int(data.get("value")))
         case "getChargeState" | "onChargeState":
             if isinstance(data, dict):
+                charging = _bool(data.get("isCharging"))
                 state = replace(
                     state,
-                    charging=_bool(data.get("isCharging")),
+                    charging=charging,
                     charge_mode=data.get("mode"),
-                    activity=MowerActivity.DOCKED
-                    if _bool(data.get("isCharging"))
-                    else state.activity,
+                    activity=MowerActivity.DOCKED if charging else state.activity,
+                    schedule_task_running=state.schedule_task_running and not charging,
                 )
         case "getCleanInfo_V2" | "onCleanInfo_V2" | "getCleanInfo" | "onCleanInfo":
-            if isinstance(data, dict):
-                activity = _clean_activity(data, state.activity)
-                if (
-                    activity is MowerActivity.PAUSED
-                    and (
-                        state.activity is MowerActivity.RETURNING
-                        or state.error_code in RETURN_TO_STATION_ERROR_CODES
-                    )
-                ):
-                    activity = MowerActivity.RETURNING
-                mower_map = state.map
-                if (
-                    activity is MowerActivity.MOWING
-                    and state.activity
-                    not in {
-                        MowerActivity.UNKNOWN,
-                        MowerActivity.MOWING,
-                        MowerActivity.PAUSED,
-                    }
-                ):
-                    mower_map = replace(mower_map, position_history=())
+            # O-series getCleanInfo stays "idle" during a scheduled job, which
+            # reports through ScheduleTaskInfo instead.
+            if isinstance(data, dict) and (
+                _job_running(data) or not state.schedule_task_running
+            ):
                 state = replace(
-                    state,
-                    activity=activity,
-                    charging=False if activity is MowerActivity.MOWING else state.charging,
-                    task_id=_task_id(data, state.task_id),
-                    task_type=_task_type(data),
-                    map=mower_map,
+                    _apply_clean_info(state, data), schedule_task_running=False
+                )
+        case "getScheduleLatestTask" | "onScheduleLatestTask":
+            # O-series lists the upcoming scheduled mows here. The G1 replies
+            # with a different shape and is left alone.
+            if isinstance(data, dict) and isinstance(data.get("task"), list):
+                state = replace(
+                    state, upcoming_schedule=_schedule_slots(data["task"])
+                )
+        case "getScheduleTaskInfo" | "onScheduleTaskInfo":
+            if isinstance(data, dict) and "state" in data:
+                state = replace(
+                    _apply_clean_info(state, data),
+                    schedule_task_running=_job_running(data),
                 )
         case "onWorkState" | "getWorkState":
             if isinstance(data, dict):
@@ -258,10 +278,13 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
         case (
             "onFwBuryPoint-bd_basicinfo"
             | "onFwBuryPoint-bd_locationjump"
+            | "onFwBuryPoint-bd_task-charge-start"
             | "onFwBuryPoint-bd_task-charge-stop"
         ):
             # O1200 LiDAR Pro leaves getPos at the origin. The live point is
             # this telemetry string (x,y and a height/flag the map does not use).
+            # The O800 RTK reports getPos chargePos as invalid, so its dock
+            # comes from chargerPos when it starts charging.
             if isinstance(data, dict):
                 state = _apply_telemetry_position(state, data)
         case "onFwBuryPoint-bd_sysinfo":
@@ -453,10 +476,71 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
         case "getRobotFeature" | "onRobotFeature":
             if isinstance(data, dict):
                 state = replace(state, robot_features=dict(data))
+        case "getOta" | "onOta":
+            if isinstance(data, dict) and data.get("ver"):
+                state = replace(state, firmware_version=str(data["ver"]))
 
     raw = dict(state.raw)
     raw[command] = data
     return replace(state, raw=raw, available=True)
+
+
+def _apply_clean_info(state: MowerState, data: dict[str, Any]) -> MowerState:
+    """Apply getCleanInfo-style job status: activity, task id and task type."""
+    activity = _clean_activity(data, state.activity)
+    if (
+        activity is MowerActivity.PAUSED
+        and (
+            state.activity is MowerActivity.RETURNING
+            or state.error_code in RETURN_TO_STATION_ERROR_CODES
+        )
+    ):
+        activity = MowerActivity.RETURNING
+    mower_map = state.map
+    if (
+        activity is MowerActivity.MOWING
+        and state.activity
+        not in {
+            MowerActivity.UNKNOWN,
+            MowerActivity.MOWING,
+            MowerActivity.PAUSED,
+        }
+    ):
+        mower_map = replace(mower_map, position_history=())
+    return replace(
+        state,
+        activity=activity,
+        charging=False if activity is MowerActivity.MOWING else state.charging,
+        task_id=_task_id(data, state.task_id),
+        task_type=_task_type(data) if "state" in data else state.task_type,
+        map=mower_map,
+    )
+
+
+def _schedule_slots(tasks: list[Any]) -> tuple[ScheduleSlot, ...]:
+    """Parse getScheduleLatestTask entries into weekly slots.
+
+    ``sDay`` is the weekday with Monday 1 (Friday is 5 and Tuesday 2 in the
+    captures). Sunday is taken as either 0 or 7.
+    """
+    slots = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        day = _int(task.get("sDay"))
+        try:
+            start = normalise_time(task.get("sTime"))
+        except ValueError:
+            continue
+        if day is None or not 0 <= day <= 7 or not start:
+            continue
+        slots.append(ScheduleSlot(weekday=day or 7, start=start))
+    return tuple(slots)
+
+
+def _job_running(data: dict[str, Any]) -> bool:
+    """Return whether a getCleanInfo-style reply describes a running job."""
+    return data.get("state") not in (None, "idle")
 
 
 def _clean_activity(data: dict[str, Any], current: MowerActivity) -> MowerActivity:

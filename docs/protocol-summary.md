@@ -76,9 +76,26 @@ telemetry points above.
 
 While mowing, the O800 RTK pushes `onMapTrace` (no `_V2`) every few seconds
 with the same chunk fields. Each push holds the whole path so far as a point
-list in layer `3`, `0;<x>,<y>;<x>,<y>;...`. The O1200 LiDAR Pro instead pushes
-`onMapTrack` with layer `2` lane segments, which the integration does not
-draw yet.
+list in layer `3`, `0;<x>,<y>;<x>,<y>;...`. The O1200 LiDAR Pro sends no
+mowed path. Its `onMapTrack` pushes hold the lanes still to mow: about once a
+minute a full layer `2` set (a `1;2;<id>;<x>,<y>;<chain>` zone plus
+`1;1;<id>;<x>,<y>;<x>,<y>` lanes), and every few seconds the remaining part
+of the current lane, or a bare `1;1;<id>` once it is done. Its `onPos`
+pushes arrive more than once a second while mowing, so the integration draws
+the mowed path from those positions and keeps the whole mow.
+
+O-series `getScheduleLatestTask` / `onScheduleLatestTask` list the upcoming
+scheduled mows as `task` entries with `sDay` (weekday, Monday `1`), `sTime`,
+`eDay` and `eTime`, nearest first. The G1 answers with a different
+`{channel, workType, status, mow}` shape. The app asks the O1200 LiDAR Pro for
+`getLifeSpan` `["blade","weedRope","trimmerBrush"]` by name. Error codes
+`401`-`435` follow the app's alert texts; `403` and `430`-`435` are sensor
+faults.
+
+The O1200 LiDAR Pro reports a scheduled mow only through `onScheduleTaskInfo`
+/ `getScheduleTaskInfo`, with the `getCleanInfo` fields (`trigger` `schedule`,
+`cleanState.content.type` `spotArea`). Its `getCleanInfo` stays `idle` for
+the whole job, so that reply must not end a running scheduled job.
 
 - Device commands use the N-GIoT endpoint `/api/iot/endpoint/control` with `apn=<command>` and `fmt=j`.
 - Command bodies use the app-style envelope with header version `0.0.22`.

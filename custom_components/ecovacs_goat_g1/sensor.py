@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -23,18 +24,20 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.typing import StateType
+from homeassistant.util import dt as dt_util
 
 from . import EcovacsConfigEntry
 from .const import DOMAIN
 from .entity import EcovacsMowerEntity, entity_unique_id
 from .goat_g1_models import variant_label
-from .mower_models import MowerState
-from .mower_profiles import CapabilityProfile, profile_for_family
+from .mower_models import MowerState, next_schedule_start
+from .mower_profiles import CapabilityProfile, MowerFamily, profile_for_family
 
 TASK_NAMES = {
     "auto": "mowing",
     "border": "edge_mowing",
     "borderrotate": "trimming",
+    "spotArea": "zone_mowing",
 }
 
 
@@ -42,7 +45,7 @@ TASK_NAMES = {
 class MowerSensorDescription(SensorEntityDescription):
     """Mower sensor description."""
 
-    value_fn: Callable[[MowerState], StateType]
+    value_fn: Callable[[MowerState], StateType | datetime]
     attr_fn: Callable[[MowerState], dict[str, Any] | None] | None = None
     exists_fn: Callable[[CapabilityProfile], bool] = lambda _profile: True
 
@@ -85,6 +88,15 @@ SENSORS: tuple[MowerSensorDescription, ...] = (
         key="current_task",
         name="Current task",
         value_fn=lambda state: TASK_NAMES.get(state.task_type, state.task_type),
+    ),
+    MowerSensorDescription(
+        key="next_scheduled_mow",
+        name="Next scheduled mow",
+        value_fn=lambda state: next_schedule_start(
+            state.upcoming_schedule, dt_util.now()
+        ),
+        device_class=SensorDeviceClass.TIMESTAMP,
+        exists_fn=lambda profile: profile.family is MowerFamily.GOAT_O_SERIES,
     ),
     MowerSensorDescription(
         key="stats_area",
@@ -162,6 +174,28 @@ SENSORS: tuple[MowerSensorDescription, ...] = (
         exists_fn=lambda profile: profile.has_lens_brush,
     ),
     MowerSensorDescription(
+        key="lifespan_trimmer_line",
+        name="Trimmer line lifespan",
+        value_fn=lambda state: state.lifespans.get("weedRope"),
+        native_unit_of_measurement=PERCENTAGE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        exists_fn=lambda profile: profile.edge_trim,
+    ),
+    MowerSensorDescription(
+        key="lifespan_trimmer_brush",
+        name="Trimmer brush lifespan",
+        value_fn=lambda state: state.lifespans.get("trimmerBrush"),
+        native_unit_of_measurement=PERCENTAGE,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        exists_fn=lambda profile: profile.edge_trim,
+    ),
+    MowerSensorDescription(
+        key="firmware_version",
+        name="Firmware version",
+        value_fn=lambda state: state.firmware_version,
+        entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MowerSensorDescription(
         key="goat_g1_model_line",
         name="GOAT model line",
         value_fn=lambda state: variant_label(state.goat_g1_variant),
@@ -218,7 +252,7 @@ class MowerSensor(EcovacsMowerEntity, SensorEntity):
         super().__init__(coordinator, entity_description.key)
 
     @property
-    def native_value(self) -> StateType:
+    def native_value(self) -> StateType | datetime:
         """Return native value."""
         return self.entity_description.value_fn(self.coordinator.data)
 

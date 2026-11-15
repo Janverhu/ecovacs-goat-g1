@@ -46,7 +46,9 @@ async def async_get_config_entry_diagnostics(
     ]
     diag["debug_capture"] = {
         "summary": controller.debug_capture.summary(),
-        "recent_events": controller.debug_capture.recent_events(limit=100),
+        "recent_events": await hass.async_add_executor_job(
+            controller.debug_capture.recent_events, 100
+        ),
     }
 
     return diag

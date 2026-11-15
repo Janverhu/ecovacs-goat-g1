@@ -97,6 +97,18 @@
       "lifespan_lens_brush": {
         "name": "Lens brush lifespan"
       },
+      "firmware_version": {
+        "name": "Firmware version"
+      },
+      "lifespan_trimmer_line": {
+        "name": "Trimmer line lifespan"
+      },
+      "lifespan_trimmer_brush": {
+        "name": "Trimmer brush lifespan"
+      },
+      "next_scheduled_mow": {
+        "name": "Next scheduled mow"
+      },
       "network_ip": {
         "name": "IP address"
       },
