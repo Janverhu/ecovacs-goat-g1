@@ -19,7 +19,12 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .debug_capture import DebugCaptureStore
 from .goat_g1_models import classify_goat_g1_variant
-from .mower_profiles import MapDialect, profile_for_model
+from .mower_profiles import (
+    EDGE_TRIM_TASK_TYPE,
+    CapabilityProfile,
+    MapDialect,
+    profile_for_model,
+)
 from .mower_compat import (
     RTK_OUTLINE_REQUEST_BODIES,
     ProtocolProfile,
@@ -44,6 +49,7 @@ from .mower_mqtt import MowerAppPresenceMqttClient, MowerMqttClient
 _LOGGER = logging.getLogger(__name__)
 FRESH_STATE_SECONDS = 300
 MAP_TRACE_TYPE = "0"
+MAP_TRACE_PUSH_COMMANDS = {"onMapTrace_V2", "onMapTrace"}
 # Area and virtual-wall layers from the live-position stream. Type ``fe`` is
 # rejected on this mower (code 20003, unknown type) and is not requested.
 APP_LIVE_MAP_TYPES = ("ar", "vw")
@@ -538,7 +544,10 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             try:
                 command = _mqtt_command(topic)
                 now = monotonic()
-                if command == "onMapTrace_V2" and not self._should_accept_trace_mqtt():
+                if (
+                    command in MAP_TRACE_PUSH_COMMANDS
+                    and not self._should_accept_trace_mqtt()
+                ):
                     self._last_mqtt_at = now
                     self._capture_event(
                         "mqtt_trace_throttled",
@@ -558,7 +567,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                     self._last_position_mqtt_at = self._last_mqtt_at
                     self._update_trace_direction_gate(state)
                     state = self._compact_live_position_segment(state)
-                if command == "onMapTrace_V2":
+                if command in MAP_TRACE_PUSH_COMMANDS:
                     if self._trace_path_changed(previous_state, state):
                         state = self._reset_live_position_segment(state)
                         self._mark_trace_mqtt_applied()
@@ -1593,6 +1602,11 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         )
 
     @property
+    def capability(self) -> CapabilityProfile:
+        """Return the static capability profile for this mower model."""
+        return self._capability
+
+    @property
     def protocol_profile(self) -> dict[str, Any]:
         """Return learned protocol details for diagnostics."""
         return {
@@ -1637,10 +1651,44 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             if previous_activity in {MowerActivity.PAUSED, MowerActivity.RETURNING}
             else "start"
         )
+        await self._async_start_job(
+            "start_mowing",
+            self._capability.clean_body(act, self.data.task_type),
+            previous_activity,
+            task_type="auto" if act == "start" else None,
+        )
+
+    async def start_edge_trim(self) -> None:
+        """Start a TrueEdge trim on a mower with an edge trimmer."""
+        if not self._capability.edge_trim:
+            raise HomeAssistantError("This mower has no TrueEdge trimmer.")
+        if self._login_is_blocked():
+            raise HomeAssistantError(
+                "ECOVACS sign-in required. Re-authenticate the integration."
+            )
+        await self.async_refresh_if_stale()
+        await self._async_start_job(
+            "start_edge_trim",
+            self._capability.edge_trim_body(),
+            self.data.activity,
+            task_type=EDGE_TRIM_TASK_TYPE,
+        )
+
+    async def _async_start_job(
+        self,
+        outcome_name: str,
+        body: dict[str, Any],
+        previous_activity: MowerActivity,
+        *,
+        task_type: str | None,
+    ) -> None:
+        """Send a start or resume, then show the mower as working.
+
+        ``task_type`` is the job a start begins. A resume passes None and keeps
+        the running job's type.
+        """
         await self.control(
-            self._capability.clean_command,
-            self._capability.clean_body(act),
-            refresh_if_stale=False,
+            self._capability.clean_command, body, refresh_if_stale=False
         )
         mower_map = self.data.map
         if previous_activity not in {
@@ -1653,12 +1701,13 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             replace(
                 self.data,
                 activity=MowerActivity.MOWING,
+                task_type=task_type or self.data.task_type,
                 map=mower_map,
             )
         )
         self._ensure_mowing_position_refresh()
         self._schedule_outcome_poll(
-            "start_mowing", lambda state: state.activity is MowerActivity.MOWING
+            outcome_name, lambda state: state.activity is MowerActivity.MOWING
         )
 
     async def pause(self) -> None:
@@ -1666,7 +1715,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         await self.async_refresh_if_stale()
         await self.control(
             self._capability.clean_command,
-            self._capability.clean_body("pause"),
+            self._capability.clean_body("pause", self.data.task_type),
             refresh_if_stale=False,
         )
         self.async_set_updated_data(replace(self.data, activity=MowerActivity.PAUSED))
@@ -1679,10 +1728,12 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         await self.async_refresh_if_stale()
         await self.control(
             self._capability.clean_command,
-            self._capability.clean_body("stop"),
+            self._capability.clean_body("stop", self.data.task_type),
             refresh_if_stale=False,
         )
-        self.async_set_updated_data(replace(self.data, activity=MowerActivity.IDLE))
+        self.async_set_updated_data(
+            replace(self.data, activity=MowerActivity.IDLE, task_type=None)
+        )
         self._schedule_outcome_poll(
             "end_mowing",
             lambda state: state.activity in {MowerActivity.IDLE, MowerActivity.DOCKED},

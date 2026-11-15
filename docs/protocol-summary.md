@@ -41,6 +41,11 @@ mowers speak **two dialects**. The integration models this with a per-device
   - Return to dock is `charge` with `act` `go` and leaves the Auto task open.
     Ending the task, which lets the next schedule start, is `clean` with
     `act` `stop`. A null HTTP body on `clean` is a successful fire-and-forget.
+  - The O1200 LiDAR Pro runs a TrueEdge trim as job type `borderrotate`. Start
+    is `clean` with `{"act":"start","content":{"type":"borderrotate","value":"reid:1"}}`.
+    Pause, resume, and stop send that act with `content.type` `borderrotate`.
+    `getCleanInfo` reports the running job in `cleanState.content.type`:
+    `auto` (mow), `border` (edge mow), or `borderrotate` (trim).
   - `getRTK` returns the single fixed **base station** (`rtks[0].x/y/sn`) plus
     GNSS signal `observations`; the station is shown on the map where the G1
     shows UWB beacons.
@@ -54,16 +59,26 @@ profile in `mower_compat.py` still adapts on failures.
 `getAreaSet` type `ar` decodes to area anchor points. The O-series lawn
 outline arrives as `onMI` pieces when the app map opens. They use the same
 `batid` / `serial` / `index` / `using` / `info` fields and base64 plus LZMA
-wrapper as `onMapInfo_V2`. Inside, layer `1` holds one
-`s<n>;<flag>;<x>,<y>;<chain>` string per boundary. The chain is a start point
-followed by 50-unit steps. Digits `1` to `8` run clockwise from north-west
-(`1` NW, `2` N, `3` NE, `4` E, `5` SE, `6` S, `7` SW, `8` W), and `d(n)` is
-direction `d` taken `n` times in total. `onArI` repeats the same boundary in
+wrapper as `onMapInfo_V2`. Inside, layer `1` holds one string per boundary.
+The O1200 LiDAR Pro sends `s<n>;<flag>;<x>,<y>;<chain>`. The chain is a start
+point followed by 50-unit steps. Digits `1` to `8` run clockwise from
+north-west (`1` NW, `2` N, `3` NE, `4` E, `5` SE, `6` S, `7` SW, `8` W), and
+`d(n)` is direction `d` taken `n` times in total. The O800 RTK (fw `1.17.21`)
+sends `s<n>;<x>,<y>;<x>,<y>;...` with every point listed. Pieces with `type`
+`-1` hold no boundary. `onMI` and `onArI` carry `mid` `1` while `getPos` and
+`onPos` carry `mid` `0` on the same mower, so only the position stream sets
+the active map id. `onArI` repeats the same boundary in
 `<id>;<x>,<y>;<chain>` pieces and is not needed for the outline. The `getMI`
 request body is not captured yet. The integration tries `{"type": "0"}` and
 `{}` in turn while the outline is missing. An RTK fix uses `deebotPos` and
 `rtkPos`. A LiDAR `getPos` stuck at the origin is ignored in favor of the
 telemetry points above.
+
+While mowing, the O800 RTK pushes `onMapTrace` (no `_V2`) every few seconds
+with the same chunk fields. Each push holds the whole path so far as a point
+list in layer `3`, `0;<x>,<y>;<x>,<y>;...`. The O1200 LiDAR Pro instead pushes
+`onMapTrack` with layer `2` lane segments, which the integration does not
+draw yet.
 
 - Device commands use the N-GIoT endpoint `/api/iot/endpoint/control` with `apn=<command>` and `fmt=j`.
 - Command bodies use the app-style envelope with header version `0.0.22`.

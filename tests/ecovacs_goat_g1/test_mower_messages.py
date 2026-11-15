@@ -794,7 +794,107 @@ def test_o_series_map_info_decodes_chain_outline() -> None:
         {"x": 0, "y": -100},
         {"x": 0, "y": 0},
     ]
-    assert state.map.mid == "1"
+    assert state.map.mid is None
+
+
+def test_o800_map_info_decodes_point_list_outline() -> None:
+    """The O800 RTK lists every boundary point instead of a direction chain."""
+    data = {
+        **_o_series_map_info(""),
+        "info": _make_subset(
+            [["1", "s1;-100,50;-50,0;0,0;0,-49"], ["2", "1"]]
+        ),
+    }
+
+    state = apply_command_data(MowerState(), "onMI", data)
+
+    assert [point.as_dict() for point in state.map.info.outline] == [
+        {"x": -100, "y": 50},
+        {"x": -50, "y": 0},
+        {"x": 0, "y": 0},
+        {"x": 0, "y": -49},
+    ]
+
+
+def test_o_series_lawn_survives_position_with_other_map_id() -> None:
+    """onMI says mid 1 and onPos mid 0 on the same mower; neither wipes the lawn."""
+    position = {
+        "deebotPos": {"x": -62, "y": -56, "a": -1, "invalid": 0},
+        "chargePos": [{"x": 0, "y": 0, "a": 0, "t": 1, "invalid": 1}],
+        "mid": "0",
+    }
+    state = apply_command_data(MowerState(), "onPos", position)
+    state = apply_command_data(state, "onMI", _o_series_map_info("4(2)6(2)8(2)2(2)"))
+    state = apply_command_data(state, "onPos", position)
+    state = apply_command_data(
+        state,
+        "onMI",
+        {
+            **_o_series_map_info(""),
+            "batid": "empty",
+            "type": "-1",
+            "info": _make_subset([["1", "s1;0;"], ["2", "0"]]),
+        },
+    )
+
+    assert state.map.mid == "0"
+    assert len(state.map.info.outline) == 5
+
+
+def test_o800_map_trace_decodes_layer_three_path() -> None:
+    """O800 onMapTrace holds the mowed path as a point list in layer 3."""
+    state = apply_command_data(
+        MowerState(map=MowerMap(mid="0")),
+        "onMapTrace",
+        {
+            "mid": "123456789",
+            "batid": "trace",
+            "serial": "1",
+            "index": "0",
+            "type": "0",
+            "info": _make_subset(
+                [["1", "-1662072064;"], ["2"], ["3", "0;-1250,-950;-1200,-900;0,-600"]]
+            ),
+        },
+    )
+
+    assert [point.as_dict() for point in state.map.trace.path] == [
+        {"x": -1250, "y": -950},
+        {"x": -1200, "y": -900},
+        {"x": 0, "y": -600},
+    ]
+    assert state.map.mid == "0"
+
+
+def test_clean_info_records_running_task_type() -> None:
+    """A TrueEdge trim reports content type borderrotate; idle clears it."""
+    state = apply_command_data(
+        MowerState(),
+        "onCleanInfo",
+        {
+            "trigger": "app",
+            "state": "clean",
+            "cleanState": {
+                "motionState": "working",
+                "cid": "122",
+                "content": {
+                    "type": "borderrotate",
+                    "value": "reid:1;",
+                    "subContent": {"type": "borderrotate"},
+                },
+            },
+        },
+    )
+
+    assert state.activity is MowerActivity.MOWING
+    assert state.task_type == "borderrotate"
+
+    state = apply_command_data(
+        state, "onCleanInfo", {"trigger": "app", "other": "", "state": "idle"}
+    )
+
+    assert state.activity is MowerActivity.IDLE
+    assert state.task_type is None
 
 
 def test_o_series_map_info_diagonal_steps() -> None:

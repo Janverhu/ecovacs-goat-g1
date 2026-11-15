@@ -34,6 +34,7 @@ from .session_store import async_remove_account_session_store
 from .util import generate_client_device_id, generate_session_store_id
 
 PLATFORMS = [
+    Platform.BINARY_SENSOR,
     Platform.BUTTON,
     Platform.LAWN_MOWER,
     Platform.NUMBER,

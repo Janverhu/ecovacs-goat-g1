@@ -6,10 +6,17 @@ from homeassistant.components.button import ButtonEntity, ButtonEntityDescriptio
 from homeassistant.components.persistent_notification import async_create, async_dismiss
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import EcovacsConfigEntry
 from .entity import EcovacsMowerEntity
+from .mower_api import EcovacsApiError, EcovacsAuthError
+
+TRIM_EDGES = ButtonEntityDescription(
+    key="trim_edges",
+    name="Trim edges",
+)
 
 BUTTONS: tuple[ButtonEntityDescription, ...] = (
     ButtonEntityDescription(
@@ -50,10 +57,20 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Add mower button entities."""
+    coordinators = config_entry.runtime_data.coordinators
     async_add_entities(
-        MowerButton(coordinator, description)
-        for coordinator in config_entry.runtime_data.coordinators
-        for description in BUTTONS
+        [
+            *(
+                MowerButton(coordinator, description)
+                for coordinator in coordinators
+                for description in BUTTONS
+            ),
+            *(
+                MowerButton(coordinator, TRIM_EDGES)
+                for coordinator in coordinators
+                if coordinator.capability.edge_trim
+            ),
+        ]
     )
 
 
@@ -76,6 +93,15 @@ class MowerButton(EcovacsMowerEntity, ButtonEntity):
                 await self.coordinator.async_refresh_state()
             case "end_mowing":
                 await self.coordinator.end_mowing()
+            case "trim_edges":
+                try:
+                    await self.coordinator.start_edge_trim()
+                except EcovacsAuthError as err:
+                    raise HomeAssistantError(
+                        "ECOVACS sign-in required. Re-authenticate the integration."
+                    ) from err
+                except EcovacsApiError as err:
+                    raise HomeAssistantError(f"Mower rejected edge trim: {err}") from err
             case "start_debug_capture":
                 self.coordinator.debug_capture.start(reason="Started from Home Assistant UI")
                 self.coordinator.async_set_updated_data(self.coordinator.data)

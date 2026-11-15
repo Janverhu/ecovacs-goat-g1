@@ -10,6 +10,11 @@ from .const import DOMAIN
 from .mower_coordinator import MowerCoordinator
 
 
+def entity_unique_id(coordinator: MowerCoordinator, key: str) -> str:
+    """Return the unique id of one mower entity."""
+    return f"{coordinator.device.did}_{key}"
+
+
 class EcovacsMowerEntity(CoordinatorEntity[MowerCoordinator]):
     """Base coordinator entity for one ECOVACS mower."""
 
@@ -18,7 +23,7 @@ class EcovacsMowerEntity(CoordinatorEntity[MowerCoordinator]):
     def __init__(self, coordinator: MowerCoordinator, key: str) -> None:
         """Initialize the entity."""
         super().__init__(coordinator)
-        self._attr_unique_id = f"{coordinator.device.did}_{key}"
+        self._attr_unique_id = entity_unique_id(coordinator, key)
 
     @property
     def device_info(self) -> DeviceInfo:

@@ -300,6 +300,7 @@ class MowerState:
     available: bool = True
     activity: MowerActivity = MowerActivity.UNKNOWN
     task_id: str | None = None
+    task_type: str | None = None
     battery: int | None = None
     charging: bool | None = None
     charge_mode: str | None = None

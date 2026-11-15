@@ -61,6 +61,43 @@ def test_o_series_clean_body_always_carries_auto_content() -> None:
         assert profile.clean_body(act) == {"act": act, "content": {"type": "auto"}}
 
 
+def test_o1200_lidar_pro_trims_edges_with_borderrotate() -> None:
+    """The app starts, pauses, resumes and stops a TrueEdge trim by its type."""
+    profile = profile_for_model("GOAT O1200 LiDAR Pro")
+    assert profile.edge_trim is True
+    assert profile.edge_trim_body() == {
+        "act": "start",
+        "content": {"type": "borderrotate", "value": "reid:1"},
+    }
+    for act in ("resume", "pause", "stop"):
+        assert profile.clean_body(act, "borderrotate") == {
+            "act": act,
+            "content": {"type": "borderrotate"},
+        }
+    assert profile.clean_body("start", "borderrotate") == {
+        "act": "start",
+        "content": {"type": "auto"},
+    }
+    assert profile.clean_body("pause", "auto") == {
+        "act": "pause",
+        "content": {"type": "auto"},
+    }
+
+
+def test_only_the_lidar_pro_has_an_edge_trimmer() -> None:
+    for model in ("GOAT O800 RTK", "GOAT O1200", "ECOVACS GOAT G1-800", "Something Else"):
+        profile = profile_for_model(model)
+        assert profile.edge_trim is False
+        assert profile.clean_body("pause", "borderrotate") == profile.clean_body("pause")
+
+
+def test_lens_brush_is_a_g1_line_part() -> None:
+    assert profile_for_model("ECOVACS GOAT G1-800").has_lens_brush is True
+    assert profile_for_model("Something Else").has_lens_brush is True
+    assert profile_for_model("GOAT O800 RTK").has_lens_brush is False
+    assert profile_for_model("GOAT O1200 LiDAR Pro").has_lens_brush is False
+
+
 def test_unknown_model_defaults_to_validated_v2_behaviour() -> None:
     """Unknown models must not regress: they keep the validated G1/V2 behaviour."""
     profile = profile_for_model("Something Else")

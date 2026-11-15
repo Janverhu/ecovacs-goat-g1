@@ -20,14 +20,22 @@ from homeassistant.const import (
     UnitOfTime,
 )
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.typing import StateType
 
 from . import EcovacsConfigEntry
-from .entity import EcovacsMowerEntity
+from .const import DOMAIN
+from .entity import EcovacsMowerEntity, entity_unique_id
 from .goat_g1_models import variant_label
 from .mower_models import MowerState
-from .mower_profiles import profile_for_family
+from .mower_profiles import CapabilityProfile, profile_for_family
+
+TASK_NAMES = {
+    "auto": "mowing",
+    "border": "edge_mowing",
+    "borderrotate": "trimming",
+}
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -36,6 +44,7 @@ class MowerSensorDescription(SensorEntityDescription):
 
     value_fn: Callable[[MowerState], StateType]
     attr_fn: Callable[[MowerState], dict[str, Any] | None] | None = None
+    exists_fn: Callable[[CapabilityProfile], bool] = lambda _profile: True
 
 
 SENSORS: tuple[MowerSensorDescription, ...] = (
@@ -71,6 +80,11 @@ SENSORS: tuple[MowerSensorDescription, ...] = (
         name="Wi-Fi SSID",
         value_fn=lambda state: state.network.ssid,
         entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+    MowerSensorDescription(
+        key="current_task",
+        name="Current task",
+        value_fn=lambda state: TASK_NAMES.get(state.task_type, state.task_type),
     ),
     MowerSensorDescription(
         key="stats_area",
@@ -145,6 +159,7 @@ SENSORS: tuple[MowerSensorDescription, ...] = (
         value_fn=lambda state: state.lifespans.get("lensBrush"),
         native_unit_of_measurement=PERCENTAGE,
         entity_category=EntityCategory.DIAGNOSTIC,
+        exists_fn=lambda profile: profile.has_lens_brush,
     ),
     MowerSensorDescription(
         key="goat_g1_model_line",
@@ -173,11 +188,16 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Add mower sensors."""
-    entities = [
-        MowerSensor(coordinator, description)
-        for coordinator in config_entry.runtime_data.coordinators
-        for description in SENSORS
-    ]
+    registry = er.async_get(hass)
+    entities: list[SensorEntity] = []
+    for coordinator in config_entry.runtime_data.coordinators:
+        for description in SENSORS:
+            if description.exists_fn(coordinator.capability):
+                entities.append(MowerSensor(coordinator, description))
+            elif entity_id := registry.async_get_entity_id(
+                "sensor", DOMAIN, entity_unique_id(coordinator, description.key)
+            ):
+                registry.async_remove(entity_id)
     entities.extend(
         DebugCaptureSensor(coordinator)
         for coordinator in config_entry.runtime_data.coordinators
