@@ -117,6 +117,7 @@ name: Mower
 The integration tries to be conservative with the mower and cloud connection:
 
 - It prefers live updates pushed by ECOVACS over MQTT.
+- When the MQTT broker refuses the push connection because the login token expired, it signs in again with a fresh token. It waits 30 seconds first and doubles the wait after each failed attempt, up to one hour.
 - It refreshes grouped state at startup and after meaningful MQTT changes (with a short debounced readback).
 - It avoids broad background polling loops.
 
