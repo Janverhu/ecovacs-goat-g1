@@ -259,6 +259,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             hass.loop,
             self._handle_mqtt_message,
             debug_capture,
+            on_login_failed=self._halt_for_login_failure,
         )
         self._app_presence_mqtt = MowerAppPresenceMqttClient(
             api,

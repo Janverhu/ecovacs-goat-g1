@@ -14,12 +14,16 @@ from typing import Any
 import paho.mqtt.client as mqtt
 
 from .debug_capture import DebugCaptureStore
-from .mower_api import EcovacsMowerApi
+from .mower_api import Credentials, EcovacsAuthError, EcovacsMowerApi
 from .mower_models import MowerDevice
 
 _LOGGER = logging.getLogger(__name__)
 APP_PRESENCE_FEATURE_META = {"fv": "1.0.0", "wv": "v2.1.0"}
 APP_PRESENCE_ROLE_META = {"app": "user", "st": 10}
+# CONNACK reasons the broker sends once the portal token is no longer valid.
+MQTT_AUTH_FAILURES = frozenset({"Bad user name or password", "Not authorized"})
+MQTT_RELOGIN_MIN_DELAY_SECONDS = 30
+MQTT_RELOGIN_MAX_DELAY_SECONDS = 3600
 
 
 class MowerMqttClient:
@@ -32,17 +36,24 @@ class MowerMqttClient:
         loop: asyncio.AbstractEventLoop,
         on_message: Callable[[str, bytes], None],
         debug_capture: DebugCaptureStore | None = None,
+        on_login_failed: Callable[[EcovacsAuthError], object] | None = None,
     ) -> None:
         self._api = api
         self._device = device
         self._loop = loop
         self._on_message = on_message
         self._debug_capture = debug_capture
+        self._on_login_failed = on_login_failed
         self._client: mqtt.Client | None = None
+        self._token: str | None = None
+        self._relogin_task: asyncio.Task[None] | None = None
+        self._relogin_delay = MQTT_RELOGIN_MIN_DELAY_SECONDS
 
     async def start(self) -> None:
         """Connect and subscribe to mower MQTT push topics."""
-        credentials = await self._api.authenticate()
+        await self._connect(await self._api.authenticate())
+
+    async def _connect(self, credentials: Credentials) -> None:
         client_id = f"{credentials.user_id}@ecouser/{self._api.client_device_id}"
         client = mqtt.Client(
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -59,6 +70,7 @@ class MowerMqttClient:
         client.on_message = self._on_paho_message
         client.on_disconnect = self._on_disconnect
         self._client = client
+        self._token = credentials.token
 
         host = f"mq-{self._api.continent}.ecouser.net"
         port = 443
@@ -66,13 +78,65 @@ class MowerMqttClient:
         client.loop_start()
 
     async def stop(self) -> None:
-        """Disconnect MQTT."""
-        if self._client is None:
-            return
+        """Disconnect MQTT and cancel a pending sign-in."""
         client = self._client
         self._client = None
+        task = self._relogin_task
+        self._relogin_task = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if client is not None:
+            await self._close(client)
+
+    async def _close(self, client: mqtt.Client) -> None:
         await self._loop.run_in_executor(None, client.disconnect)
         client.loop_stop()
+
+    def _schedule_relogin(self, client: mqtt.Client) -> None:
+        """Start one sign-in for a client the broker refused."""
+        if client is not self._client:
+            return
+        if self._relogin_task is not None and not self._relogin_task.done():
+            return
+        self._relogin_task = self._loop.create_task(
+            self._async_relogin(), name="ecovacs_goat_mqtt_relogin"
+        )
+
+    async def _async_relogin(self) -> None:
+        """Replace the refused client with one that uses a fresh token.
+
+        Waits 30 seconds before the first attempt and doubles the wait after
+        every failed one, up to an hour. A successful connect resets it.
+        """
+        rejected_token = self._token
+        while True:
+            if self._client is not None:
+                client = self._client
+                self._client = None
+                await self._close(client)
+            delay = self._relogin_delay
+            self._relogin_delay = min(delay * 2, MQTT_RELOGIN_MAX_DELAY_SECONDS)
+            _LOGGER.info("Signing in to ECOVACS MQTT again in %s seconds", delay)
+            await asyncio.sleep(delay)
+            try:
+                credentials = await self._api.authenticate()
+                if credentials.token == rejected_token:
+                    credentials = await self._api.authenticate(force=True)
+                await self._connect(credentials)
+            except EcovacsAuthError as err:
+                _LOGGER.warning(
+                    "ECOVACS MQTT sign-in failed; push updates stop until the "
+                    "integration is re-authenticated: %s",
+                    err,
+                )
+                if self._on_login_failed is not None:
+                    self._on_login_failed(err)
+                return
+            except Exception as err:  # noqa: BLE001 - keep retrying until stop()
+                _LOGGER.warning("ECOVACS MQTT sign-in failed, will retry: %s", err)
+                continue
+            return
 
     def _on_connect(
         self,
@@ -84,8 +148,13 @@ class MowerMqttClient:
     ) -> None:
         if reason_code != 0:
             _LOGGER.warning("ECOVACS MQTT connect failed: %s", reason_code)
+            if reason_code.getName() in MQTT_AUTH_FAILURES:
+                # paho would keep reconnecting with the token the broker refused.
+                client.disconnect()
+                self._loop.call_soon_threadsafe(self._schedule_relogin, client)
             return
 
+        self._relogin_delay = MQTT_RELOGIN_MIN_DELAY_SECONDS
         path = f"{self._device.did}/{self._device.device_class}/{self._device.resource}"
         topics = [
             f"iot/atr/+/{path}/j",
